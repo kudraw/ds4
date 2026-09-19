@@ -1,8 +1,16 @@
 # Qwen3.8-Flash-Next expert-cache test runbook
 
 Target: `feature/qwen38-cuda-expert-cache`, built for `sm_120a`.
-The cache keeps routed-expert rows in VRAM (LRU, per layer, gate/up/down
-slot triples) and reads the RAM-resident mmap'd GGUF only on a miss.
+Test hardware: NVIDIA RTX PRO 4500 Blackwell, 32 GiB GDDR7 ECC, 896 GB/s,
+PCIe Gen 5 (`sm_120`). Default budget = 60% of VRAM free after the engine
+loads. The cache keeps routed-expert rows in **3 shared VRAM slabs** (gate /
+up / down), one slot pool reused by every routed layer (LRU, triple-tagged),
+and reads the RAM-resident mmap'd GGUF only on a miss. The pool is capped at
+512 rows = the expert count of a single layer, so the slab reserve is bounded
+at ~2.5 GiB (Q8_0) **regardless of budget** — a budget at or above ~2560 MiB
+gives full single-layer residency and large budgets no longer risk slab OOM.
+Set the budget to control residency below that floor, or leave it high to
+trade VRAM for host page-cache headroom.
 Toggles:
 
 - `DS4_QWEN4_EXPERT_CACHE_MB=N` — VRAM budget for expert slabs; `0` disables
@@ -62,8 +70,10 @@ DS4_QWEN4_EXPERT_CACHE_MB=14336 ./ds4 --cuda -m /path/...-merged.gguf \
 
 Default layers are first/middle/last; select explicitly with
 `--qwen4-cache-probe-layers 0,1,46,47`. Each layer prints one line:
-per-layer slot size (Q8_0: 3 x 1.5625 MiB = 4.7 MiB; the same slot index
-across all 48 layers costs 225 MiB total), cold staging time and effective
+per-layer slot size (Q8_0: 3 x 1.66 MiB = 4.98 MiB; the 3 slabs are **shared**
+and the probe opens one window at a time, so the same slot index is reused
+across all 48 layers — cross-layer reuse costs PCIe re-stage traffic, not
+extra VRAM), cold staging time and effective
 GiB/s (PCIe-bound), re-stage time for the same working set (all hits,
 microseconds), a shifted working set (fresh misses plus LRU steals on
 small budgets) and a `readback OK` verdict, then a stats line. Exit
@@ -73,34 +83,58 @@ OOM, and staging corruption before the slower steps below.
 
 ### Discrete GPUs (separate VRAM)
 
-On a discrete card the eager full-model tensor preload is a unified-memory
-optimization and is **skipped** by default: it would try to `cudaMemcpy` the
-entire resident set into VRAM, compete with the expert cache and OOM at load
-time. Weights stream from host memory instead, and per-access resolution uses
-the per-range zero-copy `cudaHostRegister` path (whole-model registration
-fails over PCIe on large files) for whatever is not served from the expert
-cache. Look for `CUDA discrete GPU: skipping eager model tensor preload` at
-startup. Force the old eager behaviour with `DS4_CUDA_EAGER_PRELOAD_DISCRETE=1`
-(for a model that comfortably fits in VRAM). The `resident model ... planned`
+On a discrete card VRAM is a separate, scarce pool shared by the expert cache,
+the KV/activation working set and the dense weights. The eager preload is
+split by role:
+
+- **Dense / always-on weights** (attention, embeddings, layernorm, router,
+  shared experts `*_shexp.weight`) are **eager-copied into VRAM once** at load,
+  so kernels read them from device memory. This replaces the per-access
+  per-range `cudaHostRegister` path that fails over PCIe (invalid argument on a
+  slice of the file-backed mmap) and then `cudaMalloc`s per tensor until it OOMs
+  at token 0.
+- **Routed experts** (`*_exps.weight`) are **skipped by the eager arena** and keep
+  streaming through the expert cache. That path does `cudaMemcpy` H2D straight
+  from the pageable mmap into VRAM slabs and needs **no host pinning**, so it is
+  unaffected by the whole-file `cudaHostRegister` limit.
+
+If the dense set alone does not fit VRAM a span failure is non-fatal (warns
+once, streams the rest) instead of aborting startup. A whole-model pin whose
+span exceeds host RAM is skipped (it can never page-lock and only thrashes the
+page cache the streaming path relies on). All of this is gated on a discrete
+detection — the unified/GB300 arena and the routed path are unchanged. Force
+preload-everything with `DS4_CUDA_EAGER_PRELOAD_DISCRETE=1` (only sane when the
+whole model fits VRAM). Look for `CUDA discrete GPU: eager-preloading
+dense/non-routed weights only` at startup. The `resident model ... planned`
 memory line is still the unified estimate and overstates VRAM use on discrete.
 
-First green discrete run (RTX PRO 4500 Blackwell, 32 GiB, no explicit budget):
+First green discrete generation run (RTX PRO 4500 Blackwell, 32 GiB, budget
+`24576`, `-c 1024`), showing the corrected shared-slab accounting:
 
 ```
-ds4: CUDA discrete GPU: skipping eager model tensor preload; weights stream from host, expert cache owns VRAM
-ds4: Qwen3.8 routed-expert cache: 18.7 GiB, 79 slab slots per table
+ds4: CUDA discrete GPU: eager-preloading dense/non-routed weights only; routed experts stream from host via the expert cache
+ds4: CUDA startup model preparation covered 5.09 GiB of tensor spans in 0.843s
+ds4: expert slabs: 3 shared pools (gate/up/down) x 512 slots (cudaMalloc VRAM, reused across all 144 routed tables; rows H2D-copied in from the model on window stage; per-slot gate/up/down stride 1.66/1.66/1.66 MiB), total 2550 MiB resident
+ds4: Qwen3.8 routed-expert cache: budget 24.0 GiB -> 512 slots
+ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token path (tiled-GEMM/mm disabled)
+ds4: prefill: 3.39 t/s, generation: 7.93 t/s
+```
+
+Budget `24576` -> 512 slots (the cap), **2550 MiB** resident (was ~23.8 GiB in
+144 per-table slabs, which OOM'd at token 0). Dense weights sit in 5.09 GiB of
+device copies, KV+buffers ~1.23 GiB: the whole footprint fits 32 GiB.
+
+Earlier probe evidence (32 GiB, no explicit budget) still holds for the
+byte-exactness round trip:
+
+```
 qwen4-cache-probe: ngrams q8_0 rows=320001536 width=160 row_bytes=170 read OK (inline, pread only)
-qwen4-cache-probe: layer   0  slot 5.0 MiB  slots 79  cold 26.32 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
-qwen4-cache-probe: layer  24  slot 5.0 MiB  slots 79  cold 27.10 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
-qwen4-cache-probe: layer  47  slot 5.0 MiB  slots 79  cold 23.48 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
-[qwen4-expert-cache probe] slots=79/512 hits=60 misses=30 (66.7%) steals=0 staged=0.15 GiB
-ds4: expert-cache probe: all checks passed
+qwen4-cache-probe: layer   0  slot 5.0 MiB  cold 26.32 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
 ```
 
-Cold `0.2 GiB/s` is a single cold slot (page fault + first touch + slab alloc),
-not the streaming rate. `re-hit 0.000 ms` confirms hits read the slab directly.
-`readback OK` proves the publish -> set_window -> slab -> readback round trip is
-byte-exact against the model mapping.
+`re-hit 0.000 ms` confirms hits read the slab directly. `readback OK` proves
+the publish -> set_window -> slab -> readback round trip is byte-exact against
+the model mapping.
 
 ## 5. Correctness A/B (machine free, GPU idle)
 
@@ -121,12 +155,17 @@ second identical prompt in the same session — hit rates should climb.
 
 ## 6. Performance sweep (machine free)
 
-Default budget first, then explicit values. A slot index carries one expert
-across its gate/up/down row per layer, so cost per slot = 144 tables x
-1.5625 MiB = 225 MiB: 8 GiB = 37 slots, 16 GiB = 72, 24 GiB = 109 (of 512
-experts per layer). Routing picks top-k 10 per layer per token, so a budget
-under ~2.3 GiB (10 slots) can never stage a full layer — the stage then
-fails every call and the cache is silently inert; keep `MB >= 2304`.
+Default budget first, then explicit values. The 3 slabs form **one shared pool**
+(gate/up/down), reused by all 144 routed tables; cost per slot = gate+up+down
+= ~4.98 MiB (Q8_0), and the pool is capped at 512 rows = one full layer's
+experts. So `2560` MiB already gives 512 slots / full single-layer residency
+(~2550 MiB resident), and every budget at or above that gives the same 512
+slots — extra VRAM is left to KV/graph/dense rather than growing the slabs.
+Routing picks top-k 10 per layer per token, so a budget under ~50 MiB (<10
+slots) can never stage a full layer's working set — the stage reports failure
+with a one-time warning (host map stays consistent with the window); keep
+`MB >= 2304`. Budgets *between* ~50 MiB and 2560 trade resident slots (fewer
+than 512) for more LRU re-stage traffic.
 
 ```sh
 for MB in 0 8192 16384 24576; do
