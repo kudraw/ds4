@@ -279,6 +279,10 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
 static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
+    opt(fp, c, "--qwen4-cache-probe",
+        "Stage synthetic Qwen3.8 expert working sets, verify the expert cache and exit.");
+    opt(fp, c, "--qwen4-cache-probe-layers LIST",
+        "Comma-separated layer list for --qwen4-cache-probe (default: first/middle/last).");
     opt(fp, c, "--dump-tokens", "Print the exact CLI prompt token stream, then exit. Use --raw for literal text.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
