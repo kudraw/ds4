@@ -3421,6 +3421,19 @@ static bool accelerator_span_filter_contains(uint64_t off,
 }
 #endif
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Routed expert tensors (blk.N.ffn_gate_exps/up_exps/down_exps.weight) stream
+ * through the Qwen routed-expert cache window, which owns the bounded discrete
+ * VRAM.  They must never be eager-preloaded into the arena (the routed set is
+ * far larger than VRAM).  Shared experts (_shexp.weight) are always-on and stay
+ * with the dense set that is eager-copied to VRAM once. */
+static bool tensor_name_is_routed_expert(const ds4_str *name) {
+    static const char sfx[] = "_exps.weight";
+    const size_t n = sizeof(sfx) - 1;
+    return name->len >= n && memcmp(name->ptr + name->len - n, sfx, n) == 0;
+}
+#endif
+
 static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
@@ -3442,10 +3455,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             return false;
         }
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool discrete_stream_experts =
+        ds4_gpu_is_discrete() &&
+        getenv("DS4_CUDA_EAGER_PRELOAD_DISCRETE") == NULL;
+#endif
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
         if (t == m->ngram_tensor) continue;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (discrete_stream_experts && tensor_name_is_routed_expert(&t->name))
+            continue;
+#endif
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
             (ds4_streq(t->name, "blk.1.engram_embd.weight") ||
              ds4_streq(t->name, "blk.14.engram_embd.weight"))) continue;
@@ -3522,6 +3544,25 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
         if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            /* On a discrete card the dense set is eager-copied into bounded
+             * VRAM; if it does not fully fit, do not abort startup.  Leave the
+             * span uncached (per-access resolution / host streaming handles
+             * it) and continue so the probe and generation can still run. */
+            if (discrete_stream_experts) {
+                static int dense_span_warned = 0;
+                if (!dense_span_warned) {
+                    dense_span_warned = 1;
+                    if (tty) fputc('\n', stderr);
+                    fprintf(stderr,
+                            "ds4: CUDA discrete: dense tensor span at offset %" PRIu64
+                            " (%.2f MiB) not cached; streaming it\n",
+                            off, (double)(end - off) / 1048576.0);
+                    fflush(stderr);
+                }
+                continue;
+            }
+#endif
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "ds4: accelerator failed to prepare model tensor span %" PRIu64
@@ -3569,6 +3610,15 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Dequantizing the routed experts into VRAM is exactly the discrete
+         * blow-up the expert cache exists to avoid; stream them instead. */
+        if (ds4_gpu_is_discrete() &&
+            getenv("DS4_CUDA_EAGER_PRELOAD_DISCRETE") == NULL &&
+            tensor_name_is_routed_expert(&t->name)) {
+            continue;
+        }
+#endif
         char label[128];
         snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
         if (ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes,
@@ -3593,20 +3643,21 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
-    /* Eager span preload is a unified-memory optimization: it copies every
-     * resident tensor span into a device arena, which is advisory only where
-     * host and device share one physical pool.  On a discrete card VRAM is a
-     * separate, scarce resource owned by the Qwen routed-expert cache and the
-     * KV/activation working set; an unbounded eager arena both competes with
-     * that cache and cannot fit the resident set, so it OOMs at load time.
-     * Skip it on discrete and let per-access resolution plus the expert cache
-     * decide what enters VRAM.  Restore the old behaviour with
-     * DS4_CUDA_EAGER_PRELOAD_DISCRETE=1. */
+    /* Eager span preload is a unified-memory optimization that copies every
+     * resident tensor span into a device arena (advisory only where host and
+     * device share one physical pool).  On a discrete card VRAM is separate and
+     * scarce, owned jointly by the Qwen routed-expert cache and the KV/activation
+     * working set.  The routed-expert set is far larger than VRAM, so it is
+     * streamed; the dense/always-on set (attention, embeddings, layernorm,
+     * router, shared experts) is small enough to eager-copy into VRAM once, so
+     * kernels read it directly instead of paying the per-access per-range
+     * cudaHostRegister/cudaMalloc path that fails over PCIe.  The routed spans
+     * are filtered inside accelerator_prepare_model_tensor_spans.  Force the
+     * old preload-everything behaviour with DS4_CUDA_EAGER_PRELOAD_DISCRETE=1. */
     if (ds4_gpu_is_discrete() && getenv("DS4_CUDA_EAGER_PRELOAD_DISCRETE") == NULL) {
         fprintf(stderr,
-                "ds4: CUDA discrete GPU: skipping eager model tensor preload; "
-                "weights stream from host, expert cache owns VRAM\n");
-        return true;
+                "ds4: CUDA discrete GPU: eager-preloading dense/non-routed weights only; "
+                "routed experts stream from host via the expert cache\n");
     }
 #endif
 
