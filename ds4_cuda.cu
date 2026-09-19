@@ -933,10 +933,26 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             static int s_discrete_reg_warned = 0;
             if (ds4_gpu_is_discrete() && !s_discrete_reg_warned) {
                 s_discrete_reg_warned = 1;
+                const uint64_t map_end = offset + reg_bytes;
+                const bool overrun = g_model_registered_size != 0 &&
+                                     map_end > g_model_registered_size;
                 fprintf(stderr,
                         "ds4: CUDA per-range zero-copy register failed on discrete GPU: %s "
                         "(weights cannot stream from host)\n",
                         cudaGetErrorString(err));
+                fprintf(stderr,
+                        "ds4:   reg what=%s offset=%.2f MiB bytes=%.2f MiB reg_bytes=%.2f MiB\n"
+                        "ds4:   model_map=%p base+off=%p reg_addr=%p\n"
+                        "ds4:   map_size=%.2f GiB map_end=%.2f GiB -> %s\n",
+                        what ? what : "weights",
+                        (double)offset / 1048576.0, (double)bytes / 1048576.0,
+                        (double)reg_bytes / 1048576.0,
+                        (const void *)model_map, (const void *)host_addr,
+                        (const void *)reg_addr,
+                        (double)g_model_registered_size / 1073741824.0,
+                        (double)map_end / 1073741824.0,
+                        overrun ? "OVERRUNS MAPPING (invalid argument cause)"
+                                : "within mapping (driver rejects file-backed slice)");
             }
             (void)cudaGetLastError();
         }
@@ -4128,6 +4144,25 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
                 "ds4: CUDA aligned artifacts replace expert residency; "
                 "leaving the %.2f GiB model mmap unpinned\n",
                 (double)model_size / 1073741824.0);
+        return 1;
+    }
+
+    /* Pinning the whole model mapping requires the entire span to be page-locked
+     * in host RAM. A model file larger than physical memory can never be pinned
+     * (the attempt thrashes the page cache and returns out-of-memory), and on a
+     * discrete card it is not needed anyway: the expert cache owns VRAM and
+     * weights stream, so skip the whole-file pin when the span exceeds RAM. */
+    const long phys_pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const uint64_t phys_ram = (phys_pages > 0 && page_size > 0)
+                                  ? (uint64_t)phys_pages * (uint64_t)page_size
+                                  : 0;
+    if (phys_ram != 0 && model_size > phys_ram) {
+        fprintf(stderr,
+                "ds4: CUDA (no-copy) whole-model pin skipped: %.2f GiB model exceeds "
+                "%.2f GiB host RAM; weights stream instead\n",
+                (double)model_size / 1073741824.0,
+                (double)phys_ram / 1073741824.0);
         return 1;
     }
 
