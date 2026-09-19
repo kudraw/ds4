@@ -71,6 +71,37 @@ codes: 0 pass, 1 cache disabled or a check failed, 2 wrong backend, model
 or build. This catches geometry mismatches, slab allocation failures or
 OOM, and staging corruption before the slower steps below.
 
+### Discrete GPUs (separate VRAM)
+
+On a discrete card the eager full-model tensor preload is a unified-memory
+optimization and is **skipped** by default: it would try to `cudaMemcpy` the
+entire resident set into VRAM, compete with the expert cache and OOM at load
+time. Weights stream from host memory instead, and per-access resolution uses
+the per-range zero-copy `cudaHostRegister` path (whole-model registration
+fails over PCIe on large files) for whatever is not served from the expert
+cache. Look for `CUDA discrete GPU: skipping eager model tensor preload` at
+startup. Force the old eager behaviour with `DS4_CUDA_EAGER_PRELOAD_DISCRETE=1`
+(for a model that comfortably fits in VRAM). The `resident model ... planned`
+memory line is still the unified estimate and overstates VRAM use on discrete.
+
+First green discrete run (RTX PRO 4500 Blackwell, 32 GiB, no explicit budget):
+
+```
+ds4: CUDA discrete GPU: skipping eager model tensor preload; weights stream from host, expert cache owns VRAM
+ds4: Qwen3.8 routed-expert cache: 18.7 GiB, 79 slab slots per table
+qwen4-cache-probe: ngrams q8_0 rows=320001536 width=160 row_bytes=170 read OK (inline, pread only)
+qwen4-cache-probe: layer   0  slot 5.0 MiB  slots 79  cold 26.32 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
+qwen4-cache-probe: layer  24  slot 5.0 MiB  slots 79  cold 27.10 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
+qwen4-cache-probe: layer  47  slot 5.0 MiB  slots 79  cold 23.48 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
+[qwen4-expert-cache probe] slots=79/512 hits=60 misses=30 (66.7%) steals=0 staged=0.15 GiB
+ds4: expert-cache probe: all checks passed
+```
+
+Cold `0.2 GiB/s` is a single cold slot (page fault + first touch + slab alloc),
+not the streaming rate. `re-hit 0.000 ms` confirms hits read the slab directly.
+`readback OK` proves the publish -> set_window -> slab -> readback round trip is
+byte-exact against the model mapping.
+
 ## 5. Correctness A/B (machine free, GPU idle)
 
 Same prompt, cache off vs on. The cache is a pure optimization — outputs

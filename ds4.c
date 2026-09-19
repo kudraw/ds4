@@ -3593,6 +3593,21 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
+    /* Eager span preload is a unified-memory optimization: it copies every
+     * resident tensor span into a device arena, which is advisory only where
+     * host and device share one physical pool.  On a discrete card VRAM is a
+     * separate, scarce resource owned by the Qwen routed-expert cache and the
+     * KV/activation working set; an unbounded eager arena both competes with
+     * that cache and cannot fit the resident set, so it OOMs at load time.
+     * Skip it on discrete and let per-access resolution plus the expert cache
+     * decide what enters VRAM.  Restore the old behaviour with
+     * DS4_CUDA_EAGER_PRELOAD_DISCRETE=1. */
+    if (ds4_gpu_is_discrete() && getenv("DS4_CUDA_EAGER_PRELOAD_DISCRETE") == NULL) {
+        fprintf(stderr,
+                "ds4: CUDA discrete GPU: skipping eager model tensor preload; "
+                "weights stream from host, expert cache owns VRAM\n");
+        return true;
+    }
 #endif
 
     const double t0 = now_sec();

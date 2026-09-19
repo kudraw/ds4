@@ -883,7 +883,13 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         return cuda_model_ptr(model_map, offset);
     }
 
-    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+    /* Discrete GPUs cannot hold the streamed weights in VRAM: on those cards
+     * every dense/attention/shared range must stay resident in host RAM and be
+     * read zero-copy over PCIe (per-range cudaHostRegister below).  The arena
+     * copy is a unified-memory optimization and would fill VRAM tensor-by-
+     * tensor until it OOMs, so skip it here.  Routed-expert residency is owned
+     * by the Qwen expert cache, which registers its own VRAM slabs. */
+    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL && !ds4_gpu_is_discrete()) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr || (g_ssd_streaming_mode && g_model_fd >= 0 && model_map == g_model_fd_host_base))
             return fd_ptr;
@@ -920,6 +926,18 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             (void)cudaGetLastError();
         } else {
             if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
+            /* On a discrete card this is the *only* viable weight path (the arena
+             * copy is skipped above), so surface the reason once instead of
+             * swallowing it -- if per-range registration is unsupported the whole
+             * zero-copy strategy needs revisiting. */
+            static int s_discrete_reg_warned = 0;
+            if (ds4_gpu_is_discrete() && !s_discrete_reg_warned) {
+                s_discrete_reg_warned = 1;
+                fprintf(stderr,
+                        "ds4: CUDA per-range zero-copy register failed on discrete GPU: %s "
+                        "(weights cannot stream from host)\n",
+                        cudaGetErrorString(err));
+            }
             (void)cudaGetLastError();
         }
     }
@@ -2548,12 +2566,18 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return g_ssd_streaming_mode ? NULL : cuda_model_ptr(model_map, offset);
+        /* On a discrete card cuda_model_ptr() hands back the raw host address,
+         * which is NOT a valid device pointer (the whole-model registration
+         * fails over PCIe).  Return NULL so the caller falls through to the
+         * per-range zero-copy cudaHostRegister path instead of faulting. */
+        if (g_ssd_streaming_mode || ds4_gpu_is_discrete()) return NULL;
+        return cuda_model_ptr(model_map, offset);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
         if (g_ssd_streaming_mode || getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if (ds4_gpu_is_discrete()) return NULL; /* caller: per-range zero-copy register */
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
