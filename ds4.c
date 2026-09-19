@@ -2414,6 +2414,13 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    /* Per-row bytes of the disk-only n-gram table: width*2 for BF16,
+     * width/32*34 for row-aligned Q8_0 (width % 32 == 0). */
+    size_t ngram_row_bytes;
+    /* True when the table is interleaved with resident weights (merged
+     * split GGUFs): the mapping stays intact and n-gram reads use
+     * ngram_fd pread only; warm/GPU span builders skip ngram_tensor. */
+    bool ngram_inline;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2821,9 +2828,20 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
-            if (table || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
+            if (table || t->ndim != 2 ||
                 !t->dim[0] || t->dim[0] > 160 || !t->dim[1] || t->dim[1] > UINT32_MAX)
-                ds4_die("Qwen requires original BF16 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+                ds4_die("Qwen requires original BF16 or row-aligned Q8_0 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+            if (t->type != DS4_TENSOR_BF16 &&
+                !(t->type == DS4_TENSOR_Q8_0 && t->dim[0] % 32u == 0u)) {
+                fprintf(stderr,
+                        "ds4: Qwen n-gram table must be original BF16 or "
+                        "row-aligned Q8_0 (width a multiple of 32): got type "
+                        "%s width %llu. Repack with "
+                        "gguf-tools/qwen4_native_ngrams.py\n",
+                        tensor_type_name(t->type),
+                        (unsigned long long)t->dim[0]);
+                exit(1);
+            }
             table = t;
         } else {
             if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
@@ -2834,9 +2852,33 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     /* Tokenizer inspection can still open old main-only files. Inference
      * rejects them when binding its required n-gram tensor. */
     if (!table) return;
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || table->abs_offset % (uint64_t)page || resident_end > table->abs_offset)
-        ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
+    const size_t row_bytes = table->type == DS4_TENSOR_Q8_0
+        ? (size_t)table->dim[0] / 32u * 34u
+        : (size_t)table->dim[0] * 2u;
+    if (table->bytes != table->dim[1] * (uint64_t)row_bytes) {
+        fprintf(stderr,
+                "ds4: Qwen %s n-gram table is malformed: bytes=%llu "
+                "expected=%llu\n", tensor_type_name(table->type),
+                (unsigned long long)table->bytes,
+                (unsigned long long)(table->dim[1] * (uint64_t)row_bytes));
+        exit(1);
+    }
+    m->ngram_row_bytes = row_bytes;
+    /* When merged shard files interleave other weights after the table,
+     * unmap-on-truncate is impossible. Keep the mapping intact instead: the
+     * explicit ngram_tensor skips in every warm/GPU span builder keep the
+     * table out of the resident working set. */
+    m->ngram_inline = resident_end > table->abs_offset;
+    if (!m->ngram_inline) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0 || table->abs_offset % (uint64_t)page)
+            ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
+    } else {
+        fprintf(stderr,
+                "ds4: Qwen n-gram table is followed by resident weights "
+                "(merged shard file): keeping the mapping, n-grams are read "
+                "by pread only\n");
+    }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat main_st, table_st;
     if (fd < 0) ds4_die_errno("cannot open n-gram table", path);
@@ -2855,9 +2897,11 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
 #endif
 #endif
-    if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
-        ds4_die_errno("cannot unmap disk-only n-grams", path);
-    m->size = table->abs_offset;
+    if (!m->ngram_inline) {
+        if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
+            ds4_die_errno("cannot unmap disk-only n-grams", path);
+        m->size = table->abs_offset;
+    }
     m->ngram_fd = fd;
     m->ngram_tensor = table;
 }
@@ -3602,26 +3646,45 @@ static void model_warm_weights(const ds4_model *m) {
     const uint64_t end = m->size;
     if (start >= end) return;
 
+    /* An inline (merged-file) Qwen n-gram table lives inside the mapping
+     * but must never be faulted in: warm the weights before and after it. */
+    uint64_t ranges[2][2] = {{start, end}, {0, 0}};
+    size_t n_ranges = 1;
+    if (m->ngram_inline && m->ngram_tensor) {
+        const uint64_t b = m->ngram_tensor->abs_offset;
+        const uint64_t t = b + m->ngram_tensor->bytes;
+        ranges[0][1] = b < end ? b : end;
+        if (t < end) {
+            ranges[1][0] = t;
+            ranges[1][1] = end;
+            n_ranges = 2;
+        }
+    }
+
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     const uint8_t *p = m->map;
     volatile uint64_t checksum = 0;
+    uint64_t warm_bytes = 0;
     const double t0 = now_sec();
 
-    fprintf(stderr, "ds4: warming mapped tensor pages: %.2f GiB\n",
-            (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
-
+    for (size_t r = 0; r < n_ranges; r++) {
+        const uint64_t r0 = ranges[r][0], r1 = ranges[r][1];
+        if (r0 >= r1) continue;
+        warm_bytes += r1 - r0;
 #if defined(POSIX_MADV_WILLNEED)
-    (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
+        (void)posix_madvise((void *)(p + r0), (size_t)(r1 - r0), POSIX_MADV_WILLNEED);
 #endif
-
-    for (uint64_t off = start; off < end; off += page) {
-        checksum += p[off];
+        for (uint64_t off = r0; off < r1; off += page)
+            checksum += p[off];
+        checksum += p[r1 - 1];
     }
-    checksum += p[end - 1];
 
     const double t1 = now_sec();
-    fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
-            t1 - t0, (unsigned long long)checksum);
+    fprintf(stderr,
+            "ds4: warming mapped tensor pages: %.2f GiB in %.3fs "
+            "(checksum=%llu)\n",
+            (double)warm_bytes / (1024.0 * 1024.0 * 1024.0), t1 - t0,
+            (unsigned long long)checksum);
 }
 
 /* =========================================================================
@@ -5546,8 +5609,10 @@ static void weights_validate_qwen4_layout(
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_BF16) {
-            fprintf(stderr, "ds4: n-gram embeddings must use original BF16, got type %u\n", t);
+        if (t != DS4_TENSOR_BF16 &&
+            !(t == DS4_TENSOR_Q8_0 && w->ple_embd->dim[0] % 32u == 0u)) {
+            fprintf(stderr, "ds4: n-gram embeddings must use original BF16 or "
+                    "row-aligned Q8_0, got type %u\n", t);
             exit(1);
         }
         if (w->ple_embd->ndim != 2 || w->ple_embd->dim[0] != DS4_N_PLE_HEAD_DIM ||
@@ -57361,12 +57426,13 @@ static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
-        t->type != DS4_TENSOR_BF16 || !t->dim[0] || t->dim[0] > 160) {
+        (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q8_0) ||
+        !t->dim[0] || t->dim[0] > 160 || !m->ngram_row_bytes) {
         errno = EINVAL;
         return false;
     }
-    uint8_t raw[320];
-    const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
+    uint8_t raw[320]; /* BF16 width 160 = 320 B; Q8_0 width 160 = 170 B */
+    const uint32_t bytes = (uint32_t)m->ngram_row_bytes;
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
@@ -57377,6 +57443,21 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
             return false;
         }
         done += (uint32_t)n;
+    }
+    if (t->type == DS4_TENSOR_Q8_0) {
+        /* Q8_0 block: f16 scale at bytes 0..1, 32 int8s at bytes 2..33. */
+        for (uint32_t b = 0; b < t->dim[0] / 32u; b++) {
+            const uint8_t *blk = raw + (size_t)b * 34u;
+            const float scale = f16_to_f32(
+                (uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            if (!isfinite(scale)) {
+                errno = EDOM;
+                return false;
+            }
+            for (uint32_t i = 0; i < 32u; i++)
+                out[b * 32u + i] = scale * (float)(int8_t)blk[2 + i];
+        }
+        return true;
     }
     for (size_t i = 0; i < t->dim[0]; i++) {
         uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
@@ -57707,8 +57788,13 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
         return false;
     }
-    if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
-        fprintf(stderr, "ds4: Qwen3.8 requires original BF16 n-grams in the model GGUF\n");
+    /* Rows are consumed as decoded floats via the disk-only n-gram reader;
+     * the graph never touches the raw table bytes. */
+    if (!w->ple_embd ||
+        (w->ple_embd->type != DS4_TENSOR_BF16 &&
+         !(w->ple_embd->type == DS4_TENSOR_Q8_0 && w->ple_embd->dim[0] % 32u == 0u))) {
+        fprintf(stderr, "ds4: Qwen3.8 requires original BF16 or row-aligned "
+                "Q8_0 n-grams in the model GGUF\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -58707,6 +58793,26 @@ int ds4_engine_qwen4_expert_cache_probe(ds4_engine *e, const uint32_t *layers, i
         fprintf(stderr, "ds4: expert cache is not enabled (budget too small, integrated "
                         "GPU or slab allocation failed; see messages above)\n");
         return 1;
+    }
+    /* N-gram table sanity: decode the first and last rows and require
+     * finite output. Covers BF16 and row-aligned Q8_0 tables and works
+     * whether the table trails the weights (unmapped) or is inline. */
+    if (m->ngram_tensor) {
+        const ds4_tensor *ng = m->ngram_tensor;
+        float head[160], tail[160];
+        bool ok = ng->dim[1] > 0 && ng->dim[1] <= UINT32_MAX &&
+                  qwen4_ngram_row(m, 0, head) &&
+                  qwen4_ngram_row(m, (uint32_t)(ng->dim[1] - 1u), tail);
+        for (uint64_t i = 0; ok && i < ng->dim[0]; i++)
+            ok = isfinite(head[i]) && isfinite(tail[i]);
+        printf("qwen4-cache-probe: ngrams %s rows=%llu width=%llu row_bytes=%zu "
+               "%s%s\n", tensor_type_name(ng->type),
+               (unsigned long long)ng->dim[1],
+               (unsigned long long)ng->dim[0], m->ngram_row_bytes,
+               ok ? "read OK" : "read FAIL",
+               m->ngram_inline ? " (inline, pread only)" : " (trailing, unmapped)");
+        if (!ok)
+            return 1;
     }
     ds4_qwen4_expert_cache_set_stats(1);
     const uint32_t count = DS4_N_EXPERT;

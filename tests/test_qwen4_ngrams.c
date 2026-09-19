@@ -51,6 +51,30 @@ static void fixture(const char *path, bool bad_alignment, uint32_t type) {
     assert(!fclose(f));
 }
 
+static void fixture_q8(const char *path) {
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fwrite("GGUF", 4, 1, f) == 1);
+    u32(f, 3); u64(f, 2); u64(f, 1);
+    str(f, "general.architecture"); u32(f, 8); str(f, "qwen4exp");
+    str(f, "token_embd.weight"); u32(f, 2); u64(f, 1); u64(f, 1); u32(f, 0); u64(f, 0);
+    str(f, "per_layer_token_embd.weight"); u32(f, 2); u64(f, 160); u64(f, 1000); u32(f, 8);
+    uint64_t start = ((uint64_t)ftell(f) + 8 + 31) / 32 * 32;
+    u64(f, 65536 - start);
+    assert(!fseek(f, (long)start, SEEK_SET));
+    u32(f, 0x3f800000);
+    assert(!fseek(f, 65536, SEEK_SET));
+    for (size_t r = 0; r < 1000; r++) {
+        for (size_t b = 0; b < 5; b++) {
+            uint8_t blk[34] = {0x00, 0x3c}; /* f16 scale = 1.0 */
+            for (size_t j = 0; j < 32; j++)
+                blk[2 + j] = (uint8_t)(int8_t)(r * 3 + b * 32 + (int)j - 128);
+            assert(fwrite(blk, 1, sizeof(blk), f) == sizeof(blk));
+        }
+    }
+    assert(!fclose(f));
+}
+
 int main(void) {
     char path[] = "/tmp/ds4-qwen-ngrams-XXXXXX";
     int fd = mkstemp(path);
@@ -115,6 +139,26 @@ int main(void) {
     close(fd);
     model_close(&m);
     assert(m.ngram_fd == -1 && !m.ngram_tensor);
+    /* Row-aligned Q8_0 tables (the repacked merged-file layout) decode via
+     * f16-scale * int8-qs per 32-element block. */
+    fixture_q8(path);
+    model_open(&m, path, false, false);
+    assert(m.size == 65536 && m.file_size == 65536 + 170000);
+    assert(m.ngram_tensor && m.ngram_tensor->type == DS4_TENSOR_Q8_0 &&
+           m.ngram_row_bytes == 170 && m.max_tensor_bytes == 4);
+    {
+        uint32_t two[2] = {999, 0};
+        memset(out, 0, 2 * 160 * sizeof(*out));
+        assert(qwen4_ngram_read(&m, two, 2, out));
+        for (int k = 0; k < 2; k++) {
+            size_t r = two[k];
+            for (size_t c = 0; c < 160; c++)
+                assert(out[k * 160 + c] ==
+                       (float)(int8_t)(r * 3 + c - 128));
+        }
+    }
+    model_close(&m);
+
     for (int bad = 0; bad < 4; bad++) {
         fixture(path, bad == 0, bad == 1 ? 1 : bad == 2 ? 3 : 30);
         if (bad == 3) assert(!truncate(path, 65536 + 320000 - 1));
@@ -125,6 +169,6 @@ int main(void) {
         assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     }
     free(rows); free(out); unlink(path);
-    puts("Qwen BF16 n-grams: disk-only mapping, exact reads, batches and errors OK");
+    puts("Qwen BF16/Q8_0 n-grams: disk-only mapping, exact reads, batches and errors OK");
     return 0;
 }
