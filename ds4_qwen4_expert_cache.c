@@ -19,8 +19,6 @@ typedef struct {
     uint64_t begin;       /* table start in the model file */
     uint64_t row;         /* one expert's bytes in the file */
     uint64_t stride;      /* one expert's bytes in the slab (aligned) */
-    ds4_gpu_tensor *slab; /* slot_count * stride bytes */
-    char *slab_base;
 } qexpert_table;
 
 typedef struct {
@@ -31,6 +29,15 @@ typedef struct {
 
 static qexpert_table *g_qex_tables;
 static size_t g_qex_n_tables;
+/* Shared resident pool: ONE slab per table-kind (0=gate,1=up,2=down), reused
+ * across every layer.  A slot row holds whichever (layer,expert) the `triple`
+ * tag names; a later layer's miss overwrites it.  VRAM is therefore
+ * 3 * slot_count * kind_stride, independent of the layer count - the whole
+ * point of tagging slots by triple.  (Reserving a slab per routed table would
+ * cost n_tables * slot_count and exhaust a discrete GPU's VRAM.) */
+static ds4_gpu_tensor *g_qex_slab[3];
+static char *g_qex_slab_base[3];
+static uint64_t g_qex_kind_stride[3];
 static int32_t *g_qex_map; /* [n_triples][count] table-local slot or -1 */
 static qexpert_slot *g_qex_slots;
 static uint32_t g_qex_slot_count;
@@ -54,12 +61,15 @@ static int32_t *qex_map_row(uint32_t triple) {
 
 void ds4_qwen4_expert_cache_shutdown(void) {
     ds4_qwen4_expert_cache_unstage();
-    if (g_qex_tables) {
-        for (size_t i = 0; i < g_qex_n_tables; i++) {
-            if (g_qex_tables[i].slab) {
-                ds4_gpu_qwen4_expert_slab_release(g_qex_tables[i].slab);
-            }
+    for (int j = 0; j < 3; j++) {
+        if (g_qex_slab[j]) {
+            ds4_gpu_qwen4_expert_slab_release(g_qex_slab[j]);
+            g_qex_slab[j] = NULL;
         }
+        g_qex_slab_base[j] = NULL;
+        g_qex_kind_stride[j] = 0;
+    }
+    if (g_qex_tables) {
         free(g_qex_tables);
     }
     free(g_qex_map);
@@ -85,15 +95,23 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
     const uint32_t count = tables[0].count;
     if (count == 0)
         return false;
-    uint64_t per_slot = 0;
+    /* Resident cost of one slot = the three kind rows (gate+up+down).  Each
+     * kind slab is shared by all layers, so the layer count does NOT enter
+     * per_slot.  kind_stride[j] is the max row stride over all layers for that
+     * kind so a single shared stride indexes every layer's rows. */
+    uint64_t kind_stride[3] = {0, 0, 0};
     for (size_t i = 0; i < n_tables; i++) {
         if (tables[i].count != count || tables[i].bytes == 0 ||
             tables[i].bytes % count != 0)
             return false;
         if (tables[i].type != QEXPERT_TYPE_Q8_0 && tables[i].type != QEXPERT_TYPE_MXFP4)
             return false;
-        per_slot += qex_align_up(tables[i].bytes / count, QEXPERT_ALIGN);
+        const uint64_t stride_i = qex_align_up(tables[i].bytes / count, QEXPERT_ALIGN);
+        const size_t j = i % 3;
+        if (stride_i > kind_stride[j])
+            kind_stride[j] = stride_i;
     }
+    uint64_t per_slot = kind_stride[0] + kind_stride[1] + kind_stride[2];
     if (per_slot == 0 || budget_bytes < per_slot)
         return false; /* not even one expert triple fits */
     uint64_t slots = budget_bytes / per_slot;
@@ -126,6 +144,8 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
         g_qex_tables[i].row = tables[i].bytes / count;
         g_qex_tables[i].stride = qex_align_up(g_qex_tables[i].row, QEXPERT_ALIGN);
     }
+    for (int j = 0; j < 3; j++)
+        g_qex_kind_stride[j] = kind_stride[j];
     for (size_t t = 0; t < n_tables / 3; t++) {
         int32_t *row = qex_map_row((uint32_t)t);
         for (uint32_t e = 0; e < count; e++)
@@ -137,29 +157,34 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
         g_qex_slots[i].triple = -1;
         g_qex_slots[i].expert = -1;
     }
-    /* One slab tensor per table keeps the resolver a two-line lookup. */
+    /* Three shared slabs (gate/up/down), each slot_count rows, hold the whole
+     * resident pool for every layer at once via triple-tagged slot reuse. */
     g_qex_stats_on = getenv("DS4_QWEN4_EXPERT_CACHE_STATS") != NULL;
     double slab_vram = 0.0;
-    for (size_t i = 0; i < n_tables; i++) {
-        qexpert_table *tb = &g_qex_tables[i];
-        tb->slab = ds4_gpu_qwen4_expert_slab_reserve(g_qex_slot_count * tb->stride);
-        if (!tb->slab) {
+    for (int j = 0; j < 3; j++) {
+        g_qex_slab[j] = ds4_gpu_qwen4_expert_slab_reserve(g_qex_slot_count * g_qex_kind_stride[j]);
+        if (!g_qex_slab[j]) {
             ds4_qwen4_expert_cache_shutdown();
             return false;
         }
-        tb->slab_base = (char *)ds4_gpu_tensor_contents(tb->slab);
-        slab_vram += (double)(g_qex_slot_count * tb->stride);
+        g_qex_slab_base[j] = (char *)ds4_gpu_tensor_contents(g_qex_slab[j]);
+        slab_vram += (double)(g_qex_slot_count * g_qex_kind_stride[j]);
     }
-    /* One summary of every slab reserved: how they were obtained (a device
-     * cudaMalloc per routed table in the discrete CUDA backend, one slab per
-     * gate/up/down table of every layer), the per-slot stride and slot count,
-     * and the total VRAM reserved. Expert rows are H2D-copied from the mapped
-     * model file into slot rows when a layer's staging window opens. */
+    /* Summary of the shared resident pool: how it was obtained (three device
+     * cudaMalloc slabs in the discrete CUDA backend, one each for gate/up/down
+     * and reused by every layer), the per-slot stride and slot count, and the
+     * total VRAM reserved. Expert rows are H2D-copied from the mapped model
+     * file into slot rows when a layer's staging window opens. */
     fprintf(stderr,
-            "ds4: expert slabs: %zu tables x %u slots (cudaMalloc VRAM, one per routed "
-            "gate/up/down table; rows H2D-copied in from the model on window stage), "
-            "total %.0f MiB resident\n",
-            n_tables, g_qex_slot_count, slab_vram / (1024.0 * 1024.0));
+            "ds4: expert slabs: 3 shared pools (gate/up/down) x %u slots "
+            "(cudaMalloc VRAM, reused across all %zu routed tables; rows H2D-copied in "
+            "from the model on window stage; per-slot gate/up/down stride "
+            "%.2f/%.2f/%.2f MiB), total %.0f MiB resident\n",
+            g_qex_slot_count, n_tables,
+            g_qex_kind_stride[0] / (1024.0 * 1024.0),
+            g_qex_kind_stride[1] / (1024.0 * 1024.0),
+            g_qex_kind_stride[2] / (1024.0 * 1024.0),
+            slab_vram / (1024.0 * 1024.0));
     return true;
 }
 
@@ -224,7 +249,8 @@ static bool qex_load(uint32_t triple, uint32_t expert, int32_t slot) {
     for (uint32_t j = 0; j < 3; j++) {
         const qexpert_table *tb = &g_qex_tables[triple * 3 + j];
         const char *src = (const char *)tb->map + tb->begin + (uint64_t)expert * tb->row;
-        if (ds4_gpu_tensor_write(tb->slab, (uint64_t)slot * tb->stride, src, tb->row) == 0)
+        if (ds4_gpu_tensor_write(g_qex_slab[j], (uint64_t)slot * g_qex_kind_stride[j], src,
+                                 tb->row) == 0)
             return false;
     }
     g_qex_slots[slot].triple = (int32_t)triple;
@@ -273,8 +299,8 @@ bool ds4_qwen4_expert_cache_stage(uint32_t phys_layer, const int32_t *ids, uint3
         begins[j] = tb->begin;
         ends[j] = tb->begin + (uint64_t)g_qex_count * tb->row;
         rows[j] = tb->row;
-        strides[j] = tb->stride;
-        slabs[j] = tb->slab_base;
+        strides[j] = g_qex_kind_stride[j];
+        slabs[j] = g_qex_slab_base[j];
     }
     if (ds4_gpu_qwen4_expert_set_window(map, begins, ends, rows, strides, slabs) != 0) {
         /* Loads above already filled the host maps; without the published
@@ -310,7 +336,9 @@ bool ds4_qwen4_expert_cache_slab_read(uint32_t phys_layer, uint32_t expert,
     const qexpert_table *tb = &g_qex_tables[phys_layer * 3 + table_idx];
     if (bytes > tb->row)
         bytes = tb->row;
-    return ds4_gpu_tensor_read(tb->slab, (uint64_t)slot * tb->stride, dst, bytes) != 0;
+    return ds4_gpu_tensor_read(g_qex_slab[table_idx],
+                               (uint64_t)slot * g_qex_kind_stride[table_idx], dst,
+                               bytes) != 0;
 }
 
 void ds4_qwen4_expert_cache_log_stats_final(void) {
