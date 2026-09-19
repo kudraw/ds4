@@ -139,6 +139,7 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
     }
     /* One slab tensor per table keeps the resolver a two-line lookup. */
     g_qex_stats_on = getenv("DS4_QWEN4_EXPERT_CACHE_STATS") != NULL;
+    double slab_vram = 0.0;
     for (size_t i = 0; i < n_tables; i++) {
         qexpert_table *tb = &g_qex_tables[i];
         tb->slab = ds4_gpu_qwen4_expert_slab_reserve(g_qex_slot_count * tb->stride);
@@ -147,7 +148,18 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
             return false;
         }
         tb->slab_base = (char *)ds4_gpu_tensor_contents(tb->slab);
+        slab_vram += (double)(g_qex_slot_count * tb->stride);
     }
+    /* One summary of every slab reserved: how they were obtained (a device
+     * cudaMalloc per routed table in the discrete CUDA backend, one slab per
+     * gate/up/down table of every layer), the per-slot stride and slot count,
+     * and the total VRAM reserved. Expert rows are H2D-copied from the mapped
+     * model file into slot rows when a layer's staging window opens. */
+    fprintf(stderr,
+            "ds4: expert slabs: %zu tables x %u slots (cudaMalloc VRAM, one per routed "
+            "gate/up/down table; rows H2D-copied in from the model on window stage), "
+            "total %.0f MiB resident\n",
+            n_tables, g_qex_slot_count, slab_vram / (1024.0 * 1024.0));
     return true;
 }
 

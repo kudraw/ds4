@@ -58766,8 +58766,32 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
         return;
     }
     g_qwen4_expert_cache_map = m->map;
-    fprintf(stderr, "ds4: Qwen3.8 routed-expert cache: %.1f GiB, %u slab slots per table\n",
-            (double)budget / (1024.0 * 1024.0 * 1024.0), ds4_qwen4_expert_cache_slot_count());
+    /* Report exactly how much VRAM the cache reserves and how: one device
+     * slab (cudaMalloc) per routed table, slot_count rows each, sized to the
+     * padded per-expert row so a slot-indexed kernel offset stays in range. */
+    const uint32_t qex_slots = ds4_qwen4_expert_cache_slot_count();
+    /* Each routed table gets its own VRAM slab of qex_slots rows; total slab
+     * VRAM = slots x (sum of per-expert row bytes over all routed tables). */
+    double row_bytes_sum = 0.0;
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+        row_bytes_sum += (double)(w->layer[i].ffn_gate_exps->bytes / DS4_N_EXPERT);
+        row_bytes_sum += (double)(w->layer[i].ffn_up_exps->bytes / DS4_N_EXPERT);
+        row_bytes_sum += (double)(w->layer[i].ffn_down_exps->bytes / DS4_N_EXPERT);
+    }
+    fprintf(stderr,
+            "ds4: Qwen3.8 routed-expert cache: budget %.1f GiB -> %u slots\n"
+            "ds4:   VRAM reserved: %u layers x 3 slabs (gate/up/down) = %u cudaMalloc "
+            "slabs of %u rows each; %.0f MiB total (rows H2D-copied in from the model "
+            "when a layer's window opens)\n"
+            "ds4:   per-expert row: gate %.2f MiB / up %.2f MiB / down %.2f MiB; full "
+            "routed set on disk = %.1f GiB (only the resident slots are pinned)\n",
+            (double)budget / (1024.0 * 1024.0 * 1024.0), qex_slots,
+            DS4_N_LAYER, DS4_N_LAYER * 3u, qex_slots,
+            (double)qex_slots * row_bytes_sum / (1024.0 * 1024.0),
+            (double)(w->layer[0].ffn_gate_exps->bytes / DS4_N_EXPERT) / 1048576.0,
+            (double)(w->layer[0].ffn_up_exps->bytes / DS4_N_EXPERT) / 1048576.0,
+            (double)(w->layer[0].ffn_down_exps->bytes / DS4_N_EXPERT) / 1048576.0,
+            row_bytes_sum * DS4_N_EXPERT / (1024.0 * 1024.0 * 1024.0));
 }
 
 /* Read the routing ids back, stage the chosen rows into slab slots and
@@ -59025,6 +59049,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * window, which only the per-token kernels stage, so keep mm off. */
 #ifdef DS4_QWEN4_EXPERT_CACHE
     const bool qex_stream = ds4_qwen4_expert_cache_enabled();
+    if (qex_stream) {
+        static bool logged_stream = false;
+        if (!logged_stream) {
+            logged_stream = true;
+            fprintf(stderr,
+                    "ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token "
+                    "path (tiled-GEMM/mm disabled). Routed expert rows are copied H2D into "
+                    "bounded VRAM slab slots (one slab per gate/up/down table) and the "
+                    "kernels index slot-encoded ids there; weight() for a table base resolves "
+                    "to the slab, never to a full-table VRAM range. Slots: %u per table.\n",
+                    ds4_qwen4_expert_cache_slot_count());
+        }
+    }
 #else
     const bool qex_stream = false;
 #endif

@@ -958,12 +958,36 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    /* Last resort: a private VRAM copy of the range (cudaMalloc + H2D).  On a
+     * discrete card the zero-copy host pin above is the intended path, so
+     * landing here means pinning failed and this range now competes for VRAM
+     * with the expert-cache slab -- surface the first occurrence with the
+     * what/how/where and the running VRAM total so an OOM is attributable. */
+    if (ds4_gpu_is_discrete()) {
+        static bool s_discrete_copy_warned = false;
+        if (!s_discrete_copy_warned) {
+            s_discrete_copy_warned = true;
+            fprintf(stderr,
+                    "ds4: CUDA discrete: device-copying weight range what=%s offset=%.2f MiB "
+                    "bytes=%.2f MiB (method: cudaMalloc in VRAM + H2D memcpy; zero-copy host "
+                    "pin was unavailable). VRAM weight ranges so far: %.2f GiB\n",
+                    what ? what : "weights",
+                    (double)offset / 1048576.0, (double)bytes / 1048576.0,
+                    (double)g_model_range_bytes / 1073741824.0);
+        }
+    }
     void *dev = NULL;
     err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
-                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        fprintf(stderr,
+                "ds4: CUDA model range alloc failed for %s (offset %.2f MiB, %.2f MiB): %s\n"
+                "ds4:   method=cudaMalloc (VRAM device copy); VRAM weight ranges in use "
+                "before this alloc: %.2f GiB\n",
+                what ? what : "weights",
+                (double)offset / 1048576.0, (double)bytes / 1048576.0,
+                cudaGetErrorString(err),
+                (double)g_model_range_bytes / 1073741824.0);
         return NULL;
     }
 
