@@ -3422,6 +3422,26 @@ int ds4_gpu_qwen4_router_topk_tensor(
         const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t gate_offset,
         uint32_t gate_type, uint32_t in_dim, ds4_gpu_tensor *shared_gate,
         uint32_t n_tokens, uint32_t n_expert, uint32_t n_used);
+/* Resident routed-expert weight cache (ds4_qwen4_expert_cache.c).
+ * Slabs are plain device buffers outside the weight-table accounting: the
+ * backend declines (NULL) on integrated GPUs and in SSD mode, which keeps
+ * the cache disabled there.  While a window is open the weight resolver
+ * maps `expert_row_bytes`-aligned offsets inside [begin, end) of `map` to
+ * `slab + ((offset - begin) / expert_row_bytes) * expert_stride_bytes`: the
+ * cache keeps its ids in slot-index form, so translation is arithmetic
+ * alone.  A staged expert's host table must not be read while staged, and
+ * the window must only be open while the ids in flight really are slot
+ * indices.  Pass map == NULL to close.  Returns 0 on success. */
+ds4_gpu_tensor *ds4_gpu_qwen4_expert_slab_reserve(uint64_t bytes);
+void ds4_gpu_qwen4_expert_slab_release(ds4_gpu_tensor *tensor);
+int ds4_gpu_qwen4_expert_set_window(
+        const void *map, const uint64_t *table_begin, const uint64_t *table_end,
+        const uint64_t *expert_row_bytes, const uint64_t *expert_stride_bytes,
+        char *const *slabs);
+/* Nonzero when the selected CUDA device is discrete (separate DRAM), the
+ * configuration the expert cache and similar offloads target. */
+int ds4_gpu_is_discrete(void);
+
 /* Rotary table for the Qwen3.8 kernels: n_pairs inverse frequencies and the
  * cos/sin magnitude scale (YaRN); NULL restores plain rope from the base. */
 void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale);

@@ -82,6 +82,7 @@ typedef struct {
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_gpu_tp.h"
+#include "ds4_qwen4_expert_cache.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -749,7 +750,100 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* Resident Qwen expert cache (ds4_qwen4_expert_cache.c): while a layer's
+ * routed-expert kernels are being recorded, the engine opens a window over
+ * that layer's three expert tables and has already rewritten the routing ids
+ * to slab slot indices.  A window hit therefore translates by arithmetic
+ * alone: the kernel's computed offset begins + slot * row maps to
+ * slab + slot * stride (row and stride differ per table; slot_count is
+ * capped at the expert count so slot-encoded offsets stay inside the table
+ * range).  The window must only be open while the ids in flight really are
+ * slot indices; anything else falls through to the regular paths, which are
+ * authoritative whenever the window is closed. */
+struct cuda_expert_window_entry {
+    uint64_t begin, end, row, stride;
+    char *slab;
+};
+static const void *g_expert_window_map = NULL;
+static cuda_expert_window_entry g_expert_window[3];
+
+static const char *cuda_expert_window_range_ptr(const void *model_map, uint64_t offset,
+                                                uint64_t bytes) {
+    if (!g_expert_window_map || g_expert_window_map != model_map || bytes == 0)
+        return NULL;
+    for (int i = 0; i < 3; i++) {
+        const cuda_expert_window_entry *w = &g_expert_window[i];
+        if (!w->slab || offset < w->begin)
+            continue;
+        /* Whole-table resolutions (offset == begin, bytes spanning past the
+         * table) are the common case: the expert kernels resolve one base
+         * pointer per table and index rows themselves, so the table base
+         * redirects to the slab base and slot-indexed ids land on slab
+         * rows.  The kernel validates its own row count against the real
+         * table size before this call. */
+        if (offset != w->begin && offset + bytes > w->end)
+            continue;
+        const uint64_t d = offset - w->begin;
+        const uint64_t s = d / w->row;
+        if (d != s * w->row)
+            return NULL; /* not a whole expert row: a resident row is always whole */
+        return w->slab + s * w->stride;
+    }
+    return NULL;
+}
+
+/* ds4_cuda.cu deliberately does not include ds4_gpu.h; forward the pieces
+ * the expert cache backend needs (language linkage must match the
+ * definitions below and in ds4_gpu.h). */
+extern "C" int ds4_gpu_is_discrete(void);
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
+
+extern "C" ds4_gpu_tensor *ds4_gpu_qwen4_expert_slab_reserve(uint64_t bytes);
+extern "C" void ds4_gpu_qwen4_expert_slab_release(ds4_gpu_tensor *tensor);
+
+extern "C" ds4_gpu_tensor *ds4_gpu_qwen4_expert_slab_reserve(uint64_t bytes) {
+    if (bytes == 0 || g_ssd_streaming_mode || !ds4_gpu_is_discrete())
+        return NULL;
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+extern "C" void ds4_gpu_qwen4_expert_slab_release(ds4_gpu_tensor *tensor) {
+    if (tensor) ds4_gpu_tensor_free(tensor);
+}
+
+extern "C" int ds4_gpu_qwen4_expert_set_window(
+        const void *map, const uint64_t *table_begin, const uint64_t *table_end,
+        const uint64_t *expert_row_bytes, const uint64_t *expert_stride_bytes,
+        char *const *slabs) {
+    if (!map) {
+        g_expert_window_map = NULL;
+        for (int i = 0; i < 3; i++) g_expert_window[i].slab = NULL;
+        return 0;
+    }
+    if (!table_begin || !table_end || !expert_row_bytes || !expert_stride_bytes || !slabs)
+        return 1;
+    for (int i = 0; i < 3; i++) {
+        /* table_begin[i] is a file offset: 0 is a legal value, only the
+         * array pointer itself can be null. */
+        if (!slabs[i] || table_end[i] <= table_begin[i] ||
+            !expert_row_bytes[i] || expert_stride_bytes[i] < expert_row_bytes[i])
+            return 1;
+        g_expert_window[i].begin = table_begin[i];
+        g_expert_window[i].end = table_end[i];
+        g_expert_window[i].row = expert_row_bytes[i];
+        g_expert_window[i].stride = expert_stride_bytes[i];
+        g_expert_window[i].slab = slabs[i];
+    }
+    g_expert_window_map = map;
+    return 0;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    if (bytes != 0) {
+        const char *slab = cuda_expert_window_range_ptr(model_map, offset, bytes);
+        if (slab) return slab;
+    }
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const uint64_t end = offset + bytes;
     if (end < offset) return NULL;
@@ -33738,6 +33832,15 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     (void)enabled;
+}
+
+extern "C" int ds4_gpu_is_discrete(void) {
+    int device = 0, integrated = 1;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess)
+        return 0;
+    return integrated ? 0 : 1;
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
