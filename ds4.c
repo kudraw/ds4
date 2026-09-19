@@ -59016,7 +59016,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #else
     const uint32_t mm_min = 8u;
 #endif
-    const bool mm = T > mm_min &&
+    /* The tiled-GEMM path resolves the full routed expert table (every
+     * expert, ~850 MiB per projection here) as one contiguous device range
+     * via weight().  That needs the whole table resident in VRAM, which a
+     * discrete GPU with the expert-cache window cannot provide: the table
+     * is neither pinnable (file-backed) nor does it fit.  When the cache is
+     * enabled (discrete + budget) the routed experts must stream through the
+     * window, which only the per-token kernels stage, so keep mm off. */
+#ifdef DS4_QWEN4_EXPERT_CACHE
+    const bool qex_stream = ds4_qwen4_expert_cache_enabled();
+#else
+    const bool qex_stream = false;
+#endif
+    const bool mm = T > mm_min && !qex_stream &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
