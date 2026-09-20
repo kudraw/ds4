@@ -151,6 +151,16 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int tier) {
     return (uint64_t)free_bytes;
 }
 
+extern "C" uint64_t ds4_gpu_tier_total_vram(int tier) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (!rocm_tier_valid(tier) ||
+        hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        return 0;
+    }
+    return (uint64_t)total_bytes;
+}
+
 extern "C" int ds4_gpu_args_probe_auto_cuda(
         const int *device_filter, int filter_len, ds4_gpu_config *out,
         size_t safety_margin_bytes, char *errbuf, size_t errbuflen) {

@@ -931,7 +931,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
              * swallowing it -- if per-range registration is unsupported the whole
              * zero-copy strategy needs revisiting. */
             static int s_discrete_reg_warned = 0;
-            if (ds4_gpu_is_discrete() && !s_discrete_reg_warned) {
+            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") && ds4_gpu_is_discrete() &&
+                !s_discrete_reg_warned) {
                 s_discrete_reg_warned = 1;
                 const uint64_t map_end = offset + reg_bytes;
                 const bool overrun = g_model_registered_size != 0 &&
@@ -963,7 +964,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
      * landing here means pinning failed and this range now competes for VRAM
      * with the expert-cache slab -- surface the first occurrence with the
      * what/how/where and the running VRAM total so an OOM is attributable. */
-    if (ds4_gpu_is_discrete()) {
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") && ds4_gpu_is_discrete()) {
         static bool s_discrete_copy_warned = false;
         if (!s_discrete_copy_warned) {
             s_discrete_copy_warned = true;
@@ -1492,6 +1493,18 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     size_t free_b = 0, total_b = 0;
     uint64_t out = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) out = (uint64_t)free_b;
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    return out;
+}
+
+extern "C" uint64_t ds4_gpu_tier_total_vram(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess) prev = -1;
+    if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) return 0;
+    size_t free_b = 0, total_b = 0;
+    uint64_t out = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) out = (uint64_t)total_b;
     if (prev >= 0) (void)cudaSetDevice(prev);
     return out;
 }

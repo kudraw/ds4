@@ -209,6 +209,9 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
 uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     (void)logical_tier; return 0;
 }
+uint64_t ds4_gpu_tier_total_vram(int logical_tier) {
+    (void)logical_tier; return 0;
+}
 int ds4_gpu_device_cache_tensors(int device_id,
                                   const ds4_tensor_range *ranges,
                                   int n_ranges) {
@@ -2873,11 +2876,6 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page <= 0 || table->abs_offset % (uint64_t)page)
             ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
-    } else {
-        fprintf(stderr,
-                "ds4: Qwen n-gram table is followed by resident weights "
-                "(merged shard file): keeping the mapping, n-grams are read "
-                "by pread only\n");
     }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat main_st, table_st;
@@ -3654,11 +3652,6 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
      * cudaHostRegister/cudaMalloc path that fails over PCIe.  The routed spans
      * are filtered inside accelerator_prepare_model_tensor_spans.  Force the
      * old preload-everything behaviour with DS4_CUDA_EAGER_PRELOAD_DISCRETE=1. */
-    if (ds4_gpu_is_discrete() && getenv("DS4_CUDA_EAGER_PRELOAD_DISCRETE") == NULL) {
-        fprintf(stderr,
-                "ds4: CUDA discrete GPU: eager-preloading dense/non-routed weights only; "
-                "routed experts stream from host via the expert cache\n");
-    }
 #endif
 
     const double t0 = now_sec();
@@ -3730,13 +3723,14 @@ static void model_warm_weights(const ds4_model *m) {
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     const uint8_t *p = m->map;
     volatile uint64_t checksum = 0;
-    uint64_t warm_bytes = 0;
     const double t0 = now_sec();
+
+    fprintf(stderr, "ds4: warming mapped tensor pages: %.2f GiB\n",
+            (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
 
     for (size_t r = 0; r < n_ranges; r++) {
         const uint64_t r0 = ranges[r][0], r1 = ranges[r][1];
         if (r0 >= r1) continue;
-        warm_bytes += r1 - r0;
 #if defined(POSIX_MADV_WILLNEED)
         (void)posix_madvise((void *)(p + r0), (size_t)(r1 - r0), POSIX_MADV_WILLNEED);
 #endif
@@ -3746,11 +3740,8 @@ static void model_warm_weights(const ds4_model *m) {
     }
 
     const double t1 = now_sec();
-    fprintf(stderr,
-            "ds4: warming mapped tensor pages: %.2f GiB in %.3fs "
-            "(checksum=%llu)\n",
-            (double)warm_bytes / (1024.0 * 1024.0 * 1024.0), t1 - t0,
-            (unsigned long long)checksum);
+    fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
+            t1 - t0, (unsigned long long)checksum);
 }
 
 /* =========================================================================
@@ -58722,9 +58713,36 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
 }
 
 #ifdef DS4_QWEN4_EXPERT_CACHE
+/* Read MemTotal and MemAvailable from /proc/meminfo (KiB fields). */
+static bool qwen4_host_ram(uint64_t *total, uint64_t *available) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp)
+        return false;
+    char line[256];
+    uint64_t tot = 0, avail = 0;
+    bool got_tot = false, got_avail = false;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long kib;
+        if (sscanf(line, "MemTotal: %llu kB", &kib) == 1) {
+            tot = (uint64_t)kib * 1024ull;
+            got_tot = true;
+        } else if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+            avail = (uint64_t)kib * 1024ull;
+            got_avail = true;
+        }
+    }
+    fclose(fp);
+    if (!got_tot)
+        return false;
+    *total = tot;
+    *available = got_avail && avail < tot ? avail : (got_avail ? tot : 0);
+    return true;
+}
+
 /* Configure the resident routed-expert cache once per mapped model, on the
- * first forward (probing and CPU/Metal paths never reach this).  Budget: DS4_QWEN4_EXPERT_CACHE_MB, else ~60% of the
- * device memory free at startup.  Silence on failure keeps the plain paths. */
+ * first forward (probing and CPU/Metal paths never reach this).  The budget
+ * policy is in the default branch below; silence on failure keeps the plain
+ * paths. */
 static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *w) {
     if (g_qwen4_expert_cache_map == m->map)
         return;
@@ -58766,36 +58784,63 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
         return;
     }
     g_qwen4_expert_cache_map = m->map;
-    /* Report exactly how much VRAM the cache reserves and how: three shared
-     * device slabs (cudaMalloc), one per table-kind (gate/up/down), each
-     * slot_count rows, reused across every layer via triple-tagged slot
-     * reuse.  Slab VRAM is therefore slots x (one gate + one up + one down row)
-     * and does NOT scale with the layer count. */
+    /* One compact startup block.  Model size on disk split by transport (the
+     * routing experts are NOT kept resident; only a hot slice lives in VRAM and
+     * every other routed row is streamed from disk on demand), then the routed
+     * expert cache itself: three shared device slabs (cudaMalloc), one per
+     * table-kind (gate/up/down), slot_count rows each, reused across every
+     * layer via triple-tagged slot reuse, so slab VRAM does NOT scale with the
+     * layer count. */
     const uint32_t qex_slots = ds4_qwen4_expert_cache_slot_count();
-    const double row_gate = (double)(w->layer[0].ffn_gate_exps->bytes / DS4_N_EXPERT);
-    const double row_up = (double)(w->layer[0].ffn_up_exps->bytes / DS4_N_EXPERT);
-    const double row_down = (double)(w->layer[0].ffn_down_exps->bytes / DS4_N_EXPERT);
-    /* Full routed weight set on disk across all layers (for context only). */
-    double disk_routed = 0.0;
+    const uint64_t per_slot = (w->layer[0].ffn_gate_exps->bytes +
+                               w->layer[0].ffn_up_exps->bytes +
+                               w->layer[0].ffn_down_exps->bytes) / DS4_N_EXPERT;
+    uint64_t disk_routed = 0;
     for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
-        disk_routed += (double)(w->layer[i].ffn_gate_exps->bytes);
-        disk_routed += (double)(w->layer[i].ffn_up_exps->bytes);
-        disk_routed += (double)(w->layer[i].ffn_down_exps->bytes);
+        disk_routed += w->layer[i].ffn_gate_exps->bytes;
+        disk_routed += w->layer[i].ffn_up_exps->bytes;
+        disk_routed += w->layer[i].ffn_down_exps->bytes;
     }
+    const uint64_t ngram_bytes = m->ngram_tensor ? m->ngram_tensor->bytes : 0;
+    /* In the merged-shard (inline) layout m->size still covers the disk-only
+     * n-gram table, so subtract it as well as the routed bytes; the remainder
+     * is the dense/always-on set (attention, embeddings, layernorm, router,
+     * shared experts) which is small enough to eager-copy into VRAM in full. */
+    const uint64_t total_bytes = m->file_size ? m->file_size : m->size;
+    const uint64_t dense_bytes = total_bytes > disk_routed + ngram_bytes
+                                     ? total_bytes - disk_routed - ngram_bytes
+                                     : 0;
     fprintf(stderr,
-            "ds4: Qwen3.8 routed-expert cache: budget %.1f GiB -> %u slots\n"
-            "ds4:   VRAM reserved: 3 shared slabs (gate/up/down) of %u rows each; %.0f "
-            "MiB total (reused by all %u layers via triple-tagged slots; rows H2D-copied "
-            "in from the model when a layer's window opens)\n"
-            "ds4:   per-slot (one expert triple): gate %.2f MiB / up %.2f MiB / down "
-            "%.2f MiB; full routed set on disk = %.1f GiB (only %u resident slots pinned, "
-            "so <= %u distinct experts per layer stage at once)\n",
-            (double)budget / (1024.0 * 1024.0 * 1024.0), qex_slots,
-            qex_slots,
-            (double)qex_slots * (row_gate + row_up + row_down) / (1024.0 * 1024.0),
-            DS4_N_LAYER,
-            row_gate / 1048576.0, row_up / 1048576.0, row_down / 1048576.0,
-            disk_routed / (1024.0 * 1024.0 * 1024.0), qex_slots, qex_slots);
+            "ds4: model %.2f GiB on disk = routed experts %.2f (streamed) + "
+            "dense/shared %.2f (VRAM device-copy) + n-gram %.2f (disk pread)\n"
+            "ds4: routed-expert cache: %.2f GiB VRAM in %u slots x 3 slabs "
+            "(gate/up/down), %.2f MiB/slot, reused by all %u layers; rest streams "
+            "from disk\n",
+            (double)total_bytes / 1073741824.0,
+            (double)disk_routed / 1073741824.0,
+            (double)dense_bytes / 1073741824.0,
+            (double)ngram_bytes / 1073741824.0,
+            (double)per_slot * qex_slots / 1073741824.0, qex_slots,
+            (double)per_slot / 1048576.0, (unsigned)DS4_N_LAYER);
+    /* Whole-device memory at this point (slabs reserved, dense not yet
+     * device-copied).  Routed rows stream through host page cache, so RAM is
+     * charged by the kernel as it caches the model file. */
+    const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
+    const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
+    uint64_t ram_total = 0, ram_avail = 0;
+    const bool have_ram = qwen4_host_ram(&ram_total, &ram_avail);
+    if (vram_total)
+        fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB",
+                (double)(vram_total - vram_free) / 1073741824.0,
+                (double)vram_total / 1073741824.0);
+    else
+        fprintf(stderr, "ds4: memory: VRAM n/a");
+    if (have_ram)
+        fprintf(stderr, ", system RAM used %.2f / %.2f GiB\n",
+                (double)(ram_total - ram_avail) / 1073741824.0,
+                (double)ram_total / 1073741824.0);
+    else
+        fputc('\n', stderr);
 }
 
 /* Read the routing ids back, stage the chosen rows into slab slots and
@@ -59056,19 +59101,6 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * window, which only the per-token kernels stage, so keep mm off. */
 #ifdef DS4_QWEN4_EXPERT_CACHE
     const bool qex_stream = ds4_qwen4_expert_cache_enabled();
-    if (qex_stream) {
-        static bool logged_stream = false;
-        if (!logged_stream) {
-            logged_stream = true;
-            fprintf(stderr,
-                    "ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token "
-                    "path (tiled-GEMM/mm disabled). Routed expert rows are copied H2D into "
-                    "bounded VRAM slab slots (one slab per gate/up/down table) and the "
-                    "kernels index slot-encoded ids there; weight() for a table base resolves "
-                    "to the slab, never to a full-table VRAM range. Slots: %u per table.\n",
-                    ds4_qwen4_expert_cache_slot_count());
-        }
-    }
 #else
     const bool qex_stream = false;
 #endif
@@ -71256,7 +71288,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_output,
                  load_output_optional);
     if (e->model.ngram_tensor) {
-        fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
+        fprintf(stderr, "ds4: Qwen n-grams: %.2f GiB, disk reads only\n",
                 (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
     }
     if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {

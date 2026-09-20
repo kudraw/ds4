@@ -160,7 +160,6 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
     /* Three shared slabs (gate/up/down), each slot_count rows, hold the whole
      * resident pool for every layer at once via triple-tagged slot reuse. */
     g_qex_stats_on = getenv("DS4_QWEN4_EXPERT_CACHE_STATS") != NULL;
-    double slab_vram = 0.0;
     for (int j = 0; j < 3; j++) {
         g_qex_slab[j] = ds4_gpu_qwen4_expert_slab_reserve(g_qex_slot_count * g_qex_kind_stride[j]);
         if (!g_qex_slab[j]) {
@@ -168,23 +167,7 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
             return false;
         }
         g_qex_slab_base[j] = (char *)ds4_gpu_tensor_contents(g_qex_slab[j]);
-        slab_vram += (double)(g_qex_slot_count * g_qex_kind_stride[j]);
     }
-    /* Summary of the shared resident pool: how it was obtained (three device
-     * cudaMalloc slabs in the discrete CUDA backend, one each for gate/up/down
-     * and reused by every layer), the per-slot stride and slot count, and the
-     * total VRAM reserved. Expert rows are H2D-copied from the mapped model
-     * file into slot rows when a layer's staging window opens. */
-    fprintf(stderr,
-            "ds4: expert slabs: 3 shared pools (gate/up/down) x %u slots "
-            "(cudaMalloc VRAM, reused across all %zu routed tables; rows H2D-copied in "
-            "from the model on window stage; per-slot gate/up/down stride "
-            "%.2f/%.2f/%.2f MiB), total %.0f MiB resident\n",
-            g_qex_slot_count, n_tables,
-            g_qex_kind_stride[0] / (1024.0 * 1024.0),
-            g_qex_kind_stride[1] / (1024.0 * 1024.0),
-            g_qex_kind_stride[2] / (1024.0 * 1024.0),
-            slab_vram / (1024.0 * 1024.0));
     return true;
 }
 
