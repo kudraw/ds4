@@ -2,8 +2,9 @@
 
 Target: `feature/qwen38-cuda-expert-cache`, built for `sm_120a`.
 Test hardware: NVIDIA RTX PRO 4500 Blackwell, 32 GiB GDDR7 ECC, 896 GB/s,
-PCIe Gen 5 (`sm_120`). Default budget = 60% of VRAM free after the engine
-loads. The cache keeps routed-expert rows in **3 shared VRAM slabs** (gate /
+PCIe Gen 5 (`sm_120`). Default budget = all VRAM still free at the first
+forward (the dense device-copy, KV and graph buffers are resident by then)
+minus a small headroom (`max(free/16, 256 MiB)`) for in-forward transients. The cache keeps routed-expert rows in **3 shared VRAM slabs** (gate /
 up / down), one slot pool reused by every routed layer (LRU, triple-tagged),
 and reads the RAM-resident mmap'd GGUF only on a miss. The pool is **not**
 capped at the 512-expert count: routed experts reach their slab row through a
@@ -19,7 +20,11 @@ corrupt id past `NE + slot_count` reads out-of-bounds and trips a CUDA error
 Toggles:
 
 - `DS4_QWEN4_EXPERT_CACHE_MB=N` — VRAM budget for expert slabs; `0` disables
-  the cache (kernels use raw ids); unset = 60% of free VRAM at first forward.
+  the cache (kernels use raw ids); unset = all free VRAM at the first forward
+  minus a small transient headroom (fills the card by default).
+- Stats line fields: `slot_pool` = resident pool size (slots), `hits/misses`,
+  `steals` = LRU evictions (a slot reused for a new expert), `staged` = total
+  GiB H2D-copied into the slabs (PCIe traffic).
 - `DS4_QWEN4_EXPERT_CACHE_STATS=1` — one summary line on stderr at exit:
   slots, hits/misses %, steals, staged GiB.
 
@@ -123,11 +128,11 @@ ds4: expert slabs: 3 shared pools (gate/up/down) x 4934 slots (cudaMalloc VRAM, 
 ds4: Qwen3.8 routed-expert cache: budget 24.0 GiB -> 4934 slots
 ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token path (tiled-GEMM/mm disabled)
 ds4: prefill: 22.45 t/s, generation: 22.44 t/s
-[qwen4-expert-cache final] slots=4934/512 hits=221806 misses=46034 (82.8%) steals=41100 staged=223.90 GiB
+[qwen4-expert-cache final] slot_pool=4934 hits=221806 misses=46034 (82.8%) steals=41100 staged=223.90 GiB
 ```
 
-Budget `24576` -> **4934 slots** (no 512 cap; `slots` in the stats line is
-`slot_count/slot`, so `4934/512`), ~24 GiB resident. Dense weights sit in 5.09
+Budget `24576` -> **4934 slots** (no 512 cap; `slot_pool` is the pool size),
+~24 GiB resident. Dense weights sit in 5.09
 GiB of device copies, KV+buffers ~1.23 GiB: the whole footprint fits 32 GiB.
 The sentinel un-cap (Design A) is the reason generation jumped from the 512-slot
 figures (~7.9 t/s at the old cap) to **22.44 t/s** here: with `slot_count`

@@ -58762,8 +58762,21 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
             return; /* explicit disable */
     }
     if (!budget) {
+        /* Default: give the routed-expert cache essentially all remaining VRAM.
+         * This runs on the first forward, by which point the dense device-copy,
+         * KV and graph buffers are already resident, so the free pool is
+         * genuine headroom the expert cache is meant to fill: more resident
+         * slots -> higher cross-layer hit rate -> faster generation (measured
+         * monotonic in slot_count).  Reserve a small slice for the transients
+         * that still allocate INSIDE this first forward (cuBLAS workspaces,
+         * decode-graph capture); a reservation of literally all of free would
+         * leave those to fail.  Override the whole policy with
+         * DS4_QWEN4_EXPERT_CACHE_MB (0 disables). */
         const uint64_t free_b = ds4_gpu_tier_free_vram(0);
-        budget = free_b / 5ull * 3ull;
+        uint64_t headroom = free_b / 16ull;
+        if (headroom < (256ull * 1024ull * 1024ull))
+            headroom = 256ull * 1024ull * 1024ull;
+        budget = free_b > headroom ? free_b - headroom : 0;
     }
     if (!budget)
         return;

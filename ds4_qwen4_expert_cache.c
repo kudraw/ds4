@@ -343,9 +343,9 @@ void ds4_qwen4_expert_cache_log_stats(const char *tag) {
         return;
     const uint64_t total = g_qex_stat_hits + g_qex_stat_misses;
     fprintf(stderr,
-            "[qwen4-expert-cache %s] slots=%u/%u hits=%llu misses=%llu (%.1f%%) "
+            "[qwen4-expert-cache %s] slot_pool=%u hits=%llu misses=%llu (%.1f%%) "
             "steals=%llu staged=%.2f GiB\n",
-            tag ? tag : "", (unsigned)g_qex_slot_count, (unsigned)g_qex_count,
+            tag ? tag : "", (unsigned)g_qex_slot_count,
             (unsigned long long)g_qex_stat_hits, (unsigned long long)g_qex_stat_misses,
             total ? 100.0 * (double)g_qex_stat_hits / (double)total : 0.0,
             (unsigned long long)g_qex_stat_steals,
