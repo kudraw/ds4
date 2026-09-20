@@ -5,12 +5,17 @@ Test hardware: NVIDIA RTX PRO 4500 Blackwell, 32 GiB GDDR7 ECC, 896 GB/s,
 PCIe Gen 5 (`sm_120`). Default budget = 60% of VRAM free after the engine
 loads. The cache keeps routed-expert rows in **3 shared VRAM slabs** (gate /
 up / down), one slot pool reused by every routed layer (LRU, triple-tagged),
-and reads the RAM-resident mmap'd GGUF only on a miss. The pool is capped at
-512 rows = the expert count of a single layer, so the slab reserve is bounded
-at ~2.5 GiB (Q8_0) **regardless of budget** — a budget at or above ~2560 MiB
-gives full single-layer residency and large budgets no longer risk slab OOM.
-Set the budget to control residency below that floor, or leave it high to
-trade VRAM for host page-cache headroom.
+and reads the RAM-resident mmap'd GGUF only on a miss. The pool is **not**
+capped at the 512-expert count: routed experts reach their slab row through a
+slot **sentinel** (`NE + slot`, `NE` = 512) carried in the expert-id field, a
+band disjoint from raw ids `[0, NE)`, so `slot_count = budget / per-slot-bytes`
+grows **linearly with the budget**. That lets the resident working set span
+**multiple layers** — a single layer routes ≤512 distinct experts but 48 layers
+route far more — which is what lifts the cross-layer hit rate. Per-slot cost =
+gate+up+down ≈ 4.98 MiB (Q8_0), so a 24 GiB budget yields ~4934 slots. Size the
+budget so `slabs + dense (~5 GiB) + KV/buffers (~1.2 GiB)` still fits VRAM; a
+corrupt id past `NE + slot_count` reads out-of-bounds and trips a CUDA error
+(loud) rather than silently misreading.
 Toggles:
 
 - `DS4_QWEN4_EXPERT_CACHE_MB=N` — VRAM budget for expert slabs; `0` disables
@@ -108,21 +113,28 @@ whole model fits VRAM). Look for `CUDA discrete GPU: eager-preloading
 dense/non-routed weights only` at startup. The `resident model ... planned`
 memory line is still the unified estimate and overstates VRAM use on discrete.
 
-First green discrete generation run (RTX PRO 4500 Blackwell, 32 GiB, budget
-`24576`, `-c 1024`), showing the corrected shared-slab accounting:
+First green discrete generation run under the **sentinel (uncapped) pool**
+(RTX PRO 4500 Blackwell, 32 GiB, budget `24576`):
 
 ```
 ds4: CUDA discrete GPU: eager-preloading dense/non-routed weights only; routed experts stream from host via the expert cache
 ds4: CUDA startup model preparation covered 5.09 GiB of tensor spans in 0.843s
-ds4: expert slabs: 3 shared pools (gate/up/down) x 512 slots (cudaMalloc VRAM, reused across all 144 routed tables; rows H2D-copied in from the model on window stage; per-slot gate/up/down stride 1.66/1.66/1.66 MiB), total 2550 MiB resident
-ds4: Qwen3.8 routed-expert cache: budget 24.0 GiB -> 512 slots
+ds4: expert slabs: 3 shared pools (gate/up/down) x 4934 slots (cudaMalloc VRAM, reused across all 144 routed tables; rows H2D-copied in from the model on window stage; per-slot gate/up/down stride 1.66/1.66/1.66 MiB), total 24568 MiB resident
+ds4: Qwen3.8 routed-expert cache: budget 24.0 GiB -> 4934 slots
 ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token path (tiled-GEMM/mm disabled)
-ds4: prefill: 3.39 t/s, generation: 7.93 t/s
+ds4: prefill: 22.45 t/s, generation: 22.44 t/s
+[qwen4-expert-cache final] slots=4934/512 hits=221806 misses=46034 (82.8%) steals=41100 staged=223.90 GiB
 ```
 
-Budget `24576` -> 512 slots (the cap), **2550 MiB** resident (was ~23.8 GiB in
-144 per-table slabs, which OOM'd at token 0). Dense weights sit in 5.09 GiB of
-device copies, KV+buffers ~1.23 GiB: the whole footprint fits 32 GiB.
+Budget `24576` -> **4934 slots** (no 512 cap; `slots` in the stats line is
+`slot_count/slot`, so `4934/512`), ~24 GiB resident. Dense weights sit in 5.09
+GiB of device copies, KV+buffers ~1.23 GiB: the whole footprint fits 32 GiB.
+The sentinel un-cap (Design A) is the reason generation jumped from the 512-slot
+figures (~7.9 t/s at the old cap) to **22.44 t/s** here: with `slot_count`
+holding the working set of many layers at once, the global LRU keeps rows warm
+across layers (82.8% hit) instead of re-staging every layer's experts each
+token. `staged=223.90 GiB` over 267840 lookups against a 24 GiB pool is the
+residual PCIe traffic the 41100 steals account for.
 
 Earlier probe evidence (32 GiB, no explicit budget) still holds for the
 byte-exactness round trip:
@@ -157,15 +169,18 @@ second identical prompt in the same session — hit rates should climb.
 
 Default budget first, then explicit values. The 3 slabs form **one shared pool**
 (gate/up/down), reused by all 144 routed tables; cost per slot = gate+up+down
-= ~4.98 MiB (Q8_0), and the pool is capped at 512 rows = one full layer's
-experts. So `2560` MiB already gives 512 slots / full single-layer residency
-(~2550 MiB resident), and every budget at or above that gives the same 512
-slots — extra VRAM is left to KV/graph/dense rather than growing the slabs.
+≈ 4.98 MiB (Q8_0). With the sentinel pool `slot_count` scales **linearly with
+the budget** (no 512 cap): `MB / 4.98 MiB ≈ slots` (24576 -> 4934). The larger
+the resident pool, the more layers' working sets stay warm at once and the
+higher the hit rate — generation tracked `slot_count` monotonically in testing
+(512-slot ~7.9 t/s -> 4934-slot 22.44 t/s). Full residency of every routed
+expert (144 tables × 512 ≈ 359 GiB) is not reachable on 32 GiB, so pick the
+budget by VRAM headroom: leave room for dense (~5 GiB) + KV/buffers (~1.2 GiB).
 Routing picks top-k 10 per layer per token, so a budget under ~50 MiB (<10
 slots) can never stage a full layer's working set — the stage reports failure
-with a one-time warning (host map stays consistent with the window); keep
-`MB >= 2304`. Budgets *between* ~50 MiB and 2560 trade resident slots (fewer
-than 512) for more LRU re-stage traffic.
+with a one-time warning (host map stays consistent with the window); keep the
+budget well above that. Low budgets trade resident slots for LRU re-stage
+(steal) traffic.
 
 ```sh
 for MB in 0 8192 16384 24576; do

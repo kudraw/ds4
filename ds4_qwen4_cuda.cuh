@@ -635,8 +635,19 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
         a = sum(a); b = sum(b);
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
-        if (e >= 0 && (unsigned)e < NE) {
-            const uint64_t off = ((uint64_t)e * M + row) * rb;
+        /* Two disjoint bands ride in the expert-id field.  A raw expert id
+         * in [0,NE) is read from the disk table (cache window closed).  A
+         * resident-slot sentinel (NE + slot), written by the engine only when
+         * the cache window is open, resolves to slab row `slot`; w0 is the
+         * slab base in that mode.  The sentinel starts at NE so it can never
+         * alias a raw id, which lets slot_count exceed the per-layer expert
+         * count.  A negative id is routing noise: dropped. */
+        unsigned e_row;
+        if (e >= 0 && (unsigned)e < NE) e_row = (unsigned)e;
+        else if (e >= (int)NE) e_row = (unsigned)e - NE;
+        else e_row = UINT_MAX;
+        if (e_row != UINT_MAX) {
+            const uint64_t off = ((uint64_t)e_row * M + row) * rb;
             if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);

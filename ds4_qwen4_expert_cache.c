@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "ds4_qwen4_expert_cache.h"
 #include "ds4_gpu.h"
@@ -115,18 +116,20 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
     if (per_slot == 0 || budget_bytes < per_slot)
         return false; /* not even one expert triple fits */
     uint64_t slots = budget_bytes / per_slot;
-    /* HARD CORRECTNESS INVARIANT - do not lift without widening the id domain.
-     * Slot indices are written into the expert-id field (ds4.c rewrites the
-     * router ids via qex_slot_of and passes them to the kernels in place of
-     * expert ids).  The kernel gather/ownership logic validates that field
-     * against the expert count: any id >= count is treated as unowned and its
-     * contribution dropped ("Unowned assignments have no gate/up output").
-     * A slot index >= count would therefore resolve to a dropped row and
-     * corrupt output while the hit-rate stats still look healthy.  Keeping
-     * slots <= count keeps every slot index inside the [0, count) id domain the
-     * kernels accept. */
-    if (slots > count)
-        slots = count;
+    /* Slot indices travel in the expert-id field but are NOT raw ids: ds4.c
+     * re-encodes each as a sentinel (count + slot) before the kernels see it
+     * (see ds4.c qwen4_graph_moe_stage_experts and moe_mv in
+     * ds4_qwen4_cuda.cuh).  The id domain therefore has two disjoint bands:
+     * raw expert ids [0, count) (disk rows, cache window closed) and resident
+     * sentinels [count, count + slots) (slab rows, window open).  Because the
+     * sentinel band starts at count it can never alias a raw id, so slot_count
+     * is free to exceed the per-layer expert count - that is the whole point:
+     * a decode batch touches far more distinct experts across the layers it
+     * spans than any single layer routes, and a global LRU over one shared
+     * pool exploits that.  The sole remaining constraint is that a sentinel
+     * fits in the int32 id field the kernels read. */
+    if (slots + count > (uint64_t)INT32_MAX)
+        slots = (uint64_t)INT32_MAX - count;
     if (slots > UINT32_MAX)
         return false;
 

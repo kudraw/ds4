@@ -58891,10 +58891,19 @@ static bool qwen4_graph_moe_stage_experts(ds4_qwen4_gpu_graph *g, uint32_t il, u
         }
         return false;
     }
+    /* Re-encode each routed expert id as a resident-slot SENTINEL
+     * (DS4_N_EXPERT + slot).  The expert-id field then carries one of two
+     * disjoint bands the kernels recognise: a raw expert id in [0, NE)
+     * (window closed, read from disk) or a sentinel NE + slot in
+     * [NE, NE + slot_count) (window open, read from the slab).  Because the
+     * sentinel band starts at NE it can never alias a raw id, so slot_count
+     * is free to exceed the per-layer expert count (a decode working set
+     * larger than any single layer routes).  Noise ids (id < 0) pass through
+     * untouched and are dropped by the kernels. */
     for (uint32_t i = 0; i < n_ids; i++) {
         const int32_t id = g->qex_ids[i];
         if (id >= 0 && (uint32_t)id < DS4_N_EXPERT)
-            g->qex_ids[i] = g->qex_slot_of[id];
+            g->qex_ids[i] = (int32_t)DS4_N_EXPERT + g->qex_slot_of[id];
     }
     return ds4_gpu_tensor_write(g->qex_sel, 0, g->qex_ids, (uint64_t)n_ids * sizeof(int32_t)) != 0;
 }

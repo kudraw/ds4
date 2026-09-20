@@ -755,10 +755,11 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
  * that layer's three expert tables and has already rewritten the routing ids
  * to slab slot indices.  A window hit therefore translates by arithmetic
  * alone: the kernel's computed offset begins + slot * row maps to
- * slab + slot * stride (row and stride differ per table; slot_count is
- * capped at the expert count so slot-encoded offsets stay inside the table
- * range, and because the slot index travels in the expert-id field which the
- * kernels validate against the expert count).  The window must only be open
+ * slab + slot * stride (row and stride differ per table).  The slot index
+ * travels in the expert-id field as a sentinel (count + slot): the kernels
+ * treat an id in [0, count) as a raw disk row (window closed) and an id
+ * >= count as resident slab row (id - count) (window open), so the two bands
+ * never alias and slot_count may exceed the expert count.  The window must only be open
  * while the ids in flight really are
  * slot indices; anything else falls through to the regular paths, which are
  * authoritative whenever the window is closed. */
