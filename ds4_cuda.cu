@@ -757,7 +757,9 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
  * alone: the kernel's computed offset begins + slot * row maps to
  * slab + slot * stride (row and stride differ per table; slot_count is
  * capped at the expert count so slot-encoded offsets stay inside the table
- * range).  The window must only be open while the ids in flight really are
+ * range, and because the slot index travels in the expert-id field which the
+ * kernels validate against the expert count).  The window must only be open
+ * while the ids in flight really are
  * slot indices; anything else falls through to the regular paths, which are
  * authoritative whenever the window is closed. */
 struct cuda_expert_window_entry {

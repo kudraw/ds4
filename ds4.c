@@ -2649,6 +2649,10 @@ static void model_close(ds4_model *m) {
     if (!m) return;
 #ifdef DS4_QWEN4_EXPERT_CACHE
     if (g_qwen4_expert_cache_map != NULL && g_qwen4_expert_cache_map == m->map) {
+        /* Flush hit/miss stats while the cache is still enabled: shutdown()
+         * clears g_qex_tables so the atexit hook's enabled() guard would
+         * otherwise skip the final dump and print nothing. */
+        ds4_qwen4_expert_cache_log_stats_final();
         ds4_qwen4_expert_cache_shutdown();
         g_qwen4_expert_cache_map = NULL;
     }

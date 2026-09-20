@@ -115,9 +115,16 @@ bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size
     if (per_slot == 0 || budget_bytes < per_slot)
         return false; /* not even one expert triple fits */
     uint64_t slots = budget_bytes / per_slot;
-    /* Slot indices travel to the kernels in place of expert ids: they must
-     * stay inside [0, count) so a slot-encoded offset can never leave the
-     * table range even if a window were left open in error. */
+    /* HARD CORRECTNESS INVARIANT - do not lift without widening the id domain.
+     * Slot indices are written into the expert-id field (ds4.c rewrites the
+     * router ids via qex_slot_of and passes them to the kernels in place of
+     * expert ids).  The kernel gather/ownership logic validates that field
+     * against the expert count: any id >= count is treated as unowned and its
+     * contribution dropped ("Unowned assignments have no gate/up output").
+     * A slot index >= count would therefore resolve to a dropped row and
+     * corrupt output while the hit-rate stats still look healthy.  Keeping
+     * slots <= count keeps every slot index inside the [0, count) id domain the
+     * kernels accept. */
     if (slots > count)
         slots = count;
     if (slots > UINT32_MAX)
