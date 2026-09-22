@@ -84,10 +84,6 @@ void ds4_qwen4_expert_cache_shutdown(void) {
     g_qex_open_triple = -1;
 }
 
-void ds4_qwen4_expert_cache_set_stats(int on) {
-    g_qex_stats_on = on ? 1 : 0;
-}
-
 bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size_t n_tables,
                                       const void *model_map, uint64_t budget_bytes) {
     ds4_qwen4_expert_cache_shutdown();
@@ -318,22 +314,6 @@ void ds4_qwen4_expert_cache_unstage(void) {
  * from the slab into dst.  Returns false when the expert is not resident
  * (or the layer/table index is out of range).  bytes is clamped to the
  * table row size. */
-bool ds4_qwen4_expert_cache_slab_read(uint32_t phys_layer, uint32_t expert,
-                                      uint32_t table_idx, void *dst, uint64_t bytes) {
-    if (!ds4_qwen4_expert_cache_enabled() || phys_layer >= g_qex_n_tables / 3 ||
-        expert >= g_qex_count || table_idx >= 3 || !dst)
-        return false;
-    const int32_t slot = qex_map_row(phys_layer)[expert];
-    if (slot < 0)
-        return false;
-    const qexpert_table *tb = &g_qex_tables[phys_layer * 3 + table_idx];
-    if (bytes > tb->row)
-        bytes = tb->row;
-    return ds4_gpu_tensor_read(g_qex_slab[table_idx],
-                               (uint64_t)slot * g_qex_kind_stride[table_idx], dst,
-                               bytes) != 0;
-}
-
 void ds4_qwen4_expert_cache_log_stats_final(void) {
     ds4_qwen4_expert_cache_log_stats("final");
 }

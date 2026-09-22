@@ -66,32 +66,7 @@ assert len(r.tensors) == 1224, len(r.tensors)
 assert not any(k.startswith("split.") for k in r.fields)
 ```
 
-## 4. Engine probe (machine free, no generation)
-
-`--qwen4-cache-probe` opens the engine with the production cache
-configuration path, stages synthetic routing working sets on selected
-layers, copies staged rows back from VRAM and compares them against the
-model mapping byte for byte. No prompt, no sampling; exit code 0 = pass:
-
-```sh
-DS4_QWEN4_EXPERT_CACHE_MB=14336 ./ds4 --cuda -m /path/...-merged.gguf \
-  --qwen4-cache-probe
-```
-
-Default layers are first/middle/last; select explicitly with
-`--qwen4-cache-probe-layers 0,1,46,47`. Each layer prints one line:
-per-layer slot size (Q8_0: 3 x 1.66 MiB = 4.98 MiB; the 3 slabs are **shared**
-and the probe opens one window at a time, so the same slot index is reused
-across all 48 layers — cross-layer reuse costs PCIe re-stage traffic, not
-extra VRAM), cold staging time and effective
-GiB/s (PCIe-bound), re-stage time for the same working set (all hits,
-microseconds), a shifted working set (fresh misses plus LRU steals on
-small budgets) and a `readback OK` verdict, then a stats line. Exit
-codes: 0 pass, 1 cache disabled or a check failed, 2 wrong backend, model
-or build. This catches geometry mismatches, slab allocation failures or
-OOM, and staging corruption before the slower steps below.
-
-### Discrete GPUs (separate VRAM)
+## 4. Discrete GPUs (separate VRAM)
 
 On a discrete card VRAM is a separate, scarce pool shared by the expert cache,
 the KV/activation working set and the dense weights. The eager preload is
@@ -141,18 +116,6 @@ across layers (82.8% hit) instead of re-staging every layer's experts each
 token. `staged=223.90 GiB` over 267840 lookups against a 24 GiB pool is the
 residual PCIe traffic the 41100 steals account for.
 
-Earlier probe evidence (32 GiB, no explicit budget) still holds for the
-byte-exactness round trip:
-
-```
-qwen4-cache-probe: ngrams q8_0 rows=320001536 width=160 row_bytes=170 read OK (inline, pread only)
-qwen4-cache-probe: layer   0  slot 5.0 MiB  cold 26.32 ms  re-hit 0.000 ms  shifted 0.00 ms  readback OK
-```
-
-`re-hit 0.000 ms` confirms hits read the slab directly. `readback OK` proves
-the publish -> set_window -> slab -> readback round trip is byte-exact against
-the model mapping.
-
 ## 5. Correctness A/B (machine free, GPU idle)
 
 Same prompt, cache off vs on. The cache is a pure optimization — outputs
@@ -201,6 +164,6 @@ VRAM), lower it; the error message names the failed allocation.
 
 ## What to send back
 
-1. Unit test output (step 2), 2. the probe output and exit code (step 4),
-3. `diff` result from step 5, 4. the `[qwen4-expert-cache final]` lines +
-tokens/s from step 6, 5. any allocation errors with the exact text.
+1. Unit test output (step 2), 2. `diff` result from step 5, 3. the
+`[qwen4-expert-cache final]` lines + tokens/s from step 6, 4. any allocation
+errors with the exact text.

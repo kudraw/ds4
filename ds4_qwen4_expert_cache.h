@@ -70,9 +70,8 @@ bool ds4_qwen4_expert_cache_enabled(void);
 /* Device slab slots per layer table after a successful configure. */
 uint32_t ds4_qwen4_expert_cache_slot_count(void);
 
-/* Hit/miss counters to stderr when on (configure also honours
- * DS4_QWEN4_EXPERT_CACHE_STATS). */
-void ds4_qwen4_expert_cache_set_stats(int on);
+/* Hit/miss counters to stderr.  Enabled at configure time via
+ * DS4_QWEN4_EXPERT_CACHE_STATS. */
 void ds4_qwen4_expert_cache_log_stats(const char *tag);
 void ds4_qwen4_expert_cache_log_stats_final(void);
 
@@ -88,13 +87,6 @@ bool ds4_qwen4_expert_cache_stage(uint32_t phys_layer, const int32_t *ids, uint3
 
 /* Close the window opened by the last stage.  Idempotent. */
 void ds4_qwen4_expert_cache_unstage(void);
-
-/* Diagnostic readback for the engine probe (--qwen4-cache-probe): copy one
- * resident expert row (table_idx 0=gate 1=up 2=down) from the slab into
- * `dst`; bytes is clamped to the row size.  Returns false when the expert
- * is not resident or any index is out of range. */
-bool ds4_qwen4_expert_cache_slab_read(uint32_t phys_layer, uint32_t expert,
-                                      uint32_t table_idx, void *dst, uint64_t bytes);
 
 #ifdef __cplusplus
 }

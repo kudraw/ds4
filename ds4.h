@@ -360,13 +360,6 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_deepseek41(ds4_engine *e);
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
-/* Qwen3.8 routed-expert cache diagnostic (--qwen4-cache-probe): configures
- * the cache for the loaded model, stages synthetic routing working sets,
- * verifies staged bytes against the model mapping and prints per-layer
- * timings.  layers == NULL probes the first/middle/last layers.  Returns 0
- * on success, 1 when the cache is unavailable or a check failed, 2 when the
- * model or backend is not supported.  Call after ds4_engine_open. */
-int ds4_engine_qwen4_expert_cache_probe(ds4_engine *e, const uint32_t *layers, int n_layers);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);

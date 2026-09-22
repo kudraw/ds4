@@ -98,11 +98,6 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
-    /* Qwen3.8 routed-expert cache diagnostic (--qwen4-cache-probe): runs the
-     * engine-level probe after open and exits; optional comma layer list via
-     * --qwen4-cache-probe-layers. */
-    bool qwen4_cache_probe;
-    const char *qwen4_cache_probe_layers;
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -2203,11 +2198,6 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
-        } else if (!strcmp(arg, "--qwen4-cache-probe")) {
-            c.qwen4_cache_probe = true;
-        } else if (!strcmp(arg, "--qwen4-cache-probe-layers")) {
-            c.qwen4_cache_probe = true;
-            c.qwen4_cache_probe_layers = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -2348,35 +2338,6 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
-    }
-    if (cfg.qwen4_cache_probe) {
-        uint32_t probe_layers[64];
-        int n_probe_layers = 0;
-        if (cfg.qwen4_cache_probe_layers) {
-            const char *p = cfg.qwen4_cache_probe_layers;
-            while (*p && n_probe_layers < 64) {
-                char *end = NULL;
-                unsigned long v = strtoul(p, &end, 10);
-                if (end == p)
-                    break;
-                probe_layers[n_probe_layers++] = (uint32_t)v;
-                p = (*end == ',') ? end + 1 : end;
-            }
-            if (n_probe_layers == 0) {
-                fprintf(stderr, "ds4: --qwen4-cache-probe-layers: no layers parsed in \"%s\"\n",
-                        cfg.qwen4_cache_probe_layers);
-                ds4_engine_close(engine);
-                ds4_dist_options_free(cfg.dist);
-                free(cfg.prompt_owned);
-                return 2;
-            }
-        }
-        int probe_rc = ds4_engine_qwen4_expert_cache_probe(
-            engine, n_probe_layers ? probe_layers : NULL, n_probe_layers);
-        ds4_engine_close(engine);
-        ds4_dist_options_free(cfg.dist);
-        free(cfg.prompt_owned);
-        return probe_rc;
     }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
