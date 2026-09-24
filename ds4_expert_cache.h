@@ -1,5 +1,6 @@
 /*
- * Resident routed-expert weight cache for Qwen3.8-Flash-Next on discrete CUDA.
+ * Resident routed-expert weight cache for discrete CUDA (any routed-MoE family
+ * whose experts are stored as one equal-width row per expert per table).
  *
  * The routed expert tables (gate/up/down per layer, one row per expert)
  * dominate the model, but any one forward touches only a few routed experts
@@ -26,13 +27,13 @@
  * separately pinned or copied into the q4x arena.
  *
  * Host logic only: this file performs no CUDA calls itself.  Device memory
- * comes from ds4_gpu_qwen4_expert_slab_reserve() and window activation goes
- * through ds4_gpu_qwen4_expert_set_window(), both CUDA backend.  Where the
+ * comes from ds4_gpu_expert_slab_reserve() and window activation goes
+ * through ds4_gpu_expert_set_window(), both CUDA backend.  Where the
  * backend declines (integrated GPUs, SSD mode, allocation failure) the cache
  * stays disabled and the regular paths run.
  */
-#ifndef DS4_QWEN4_EXPERT_CACHE_H
-#define DS4_QWEN4_EXPERT_CACHE_H
+#ifndef DS4_EXPERT_CACHE_H
+#define DS4_EXPERT_CACHE_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -55,41 +56,41 @@ typedef struct {
     uint64_t bytes;       /* count * file row bytes */
     uint32_t count;       /* experts per table */
     uint32_t type;        /* GGUF type id: q8_0 (8) or mxfp4 (39) */
-} ds4_qwen4_expert_table;
+} ds4_expert_table;
 
 /* Lay out the cache for `n_tables` tables and a total device budget.
  * `model_map` is the engine's mapped model base (host pointer).  Returns
  * false when the budget cannot hold a single expert triple or the tables are
  * not cacheable (mixed expert row counts, unsupported types).  Valid until
  * shutdown; call before any staging. */
-bool ds4_qwen4_expert_cache_configure(const ds4_qwen4_expert_table *tables, size_t n_tables,
-                                      const void *model_map, uint64_t budget_bytes);
-void ds4_qwen4_expert_cache_shutdown(void);
-bool ds4_qwen4_expert_cache_enabled(void);
+bool ds4_expert_cache_configure(const ds4_expert_table *tables, size_t n_tables,
+                                const void *model_map, uint64_t budget_bytes);
+void ds4_expert_cache_shutdown(void);
+bool ds4_expert_cache_enabled(void);
 
 /* Device slab slots per layer table after a successful configure. */
-uint32_t ds4_qwen4_expert_cache_slot_count(void);
+uint32_t ds4_expert_cache_slot_count(void);
 
 /* Hit/miss counters to stderr.  Enabled at configure time via
- * DS4_QWEN4_EXPERT_CACHE_STATS. */
-void ds4_qwen4_expert_cache_log_stats(const char *tag);
-void ds4_qwen4_expert_cache_log_stats_final(void);
+ * DS4_EXPERT_CACHE_STATS. */
+void ds4_expert_cache_log_stats(const char *tag);
+void ds4_expert_cache_log_stats_final(void);
 
 /* Current slot holding one expert's rows, or -1 when not resident.  Fails
  * only for out-of-range ids or when the cache is off. */
-bool ds4_qwen4_expert_cache_lookup(uint32_t phys_layer, uint32_t expert, int32_t *slot);
+bool ds4_expert_cache_lookup(uint32_t phys_layer, uint32_t expert, int32_t *slot);
 
 /* Stage a layer for kernel recording: load every expert in `ids` (LRU,
  * layer-tagged), publish the CUDA resolution window, and write each expert's
  * device slot into `slots` (index by expert id, entries untouched by `ids`
  * set to -1).  Serializes with device work (it syncs to copy rows). */
-bool ds4_qwen4_expert_cache_stage(uint32_t phys_layer, const int32_t *ids, uint32_t n_ids, int32_t *slots);
+bool ds4_expert_cache_stage(uint32_t phys_layer, const int32_t *ids, uint32_t n_ids, int32_t *slots);
 
 /* Close the window opened by the last stage.  Idempotent. */
-void ds4_qwen4_expert_cache_unstage(void);
+void ds4_expert_cache_unstage(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* DS4_QWEN4_EXPERT_CACHE_H */
+#endif /* DS4_EXPERT_CACHE_H */

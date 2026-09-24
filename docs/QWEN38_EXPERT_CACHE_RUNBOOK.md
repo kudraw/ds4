@@ -19,13 +19,13 @@ corrupt id past `NE + slot_count` reads out-of-bounds and trips a CUDA error
 (loud) rather than silently misreading.
 Toggles:
 
-- `DS4_QWEN4_EXPERT_CACHE_MB=N` — VRAM budget for expert slabs; `0` disables
+- `DS4_EXPERT_CACHE_MB=N` — VRAM budget for expert slabs; `0` disables
   the cache (kernels use raw ids); unset = all free VRAM at the first forward
   minus a small transient headroom (fills the card by default).
 - Stats line fields: `slot_pool` = resident pool size (slots), `hits/misses`,
   `steals` = LRU evictions (a slot reused for a new expert), `staged` = total
   GiB H2D-copied into the slabs (PCIe traffic).
-- `DS4_QWEN4_EXPERT_CACHE_STATS=1` — one summary line on stderr at exit:
+- `DS4_EXPERT_CACHE_STATS=1` — one summary line on stderr at exit:
   slots, hits/misses %, steals, staged GiB.
 
 Runtime needs `LD_LIBRARY_PATH=/opt/cuda/lib64` unless the CUDA runtime is
@@ -34,13 +34,13 @@ registered with ldconfig.
 ## 1. Build
 
 ```sh
-make -j8 CUDA_ARCH=sm_120a ds4 tests/ds4_qwen4_expert_cache_test
+make -j8 CUDA_ARCH=sm_120a ds4 tests/ds4_expert_cache_test
 ```
 
 ## 2. Unit smoke test (few MB of VRAM, safe next to a running server)
 
 ```sh
-./tests/ds4_qwen4_expert_cache_test
+./tests/ds4_expert_cache_test
 ```
 
 Expect a `PASS` line per check and `ALL PASS 0 failure(s)`; exit code 0.
@@ -103,7 +103,7 @@ ds4: expert slabs: 3 shared pools (gate/up/down) x 4934 slots (cudaMalloc VRAM, 
 ds4: Qwen3.8 routed-expert cache: budget 24.0 GiB -> 4934 slots
 ds4: Qwen MoE: routed-expert cache active -> using STREAMING per-token path (tiled-GEMM/mm disabled)
 ds4: prefill: 22.45 t/s, generation: 22.44 t/s
-[qwen4-expert-cache final] slot_pool=4934 hits=221806 misses=46034 (82.8%) steals=41100 staged=223.90 GiB
+[expert-cache final] slot_pool=4934 hits=221806 misses=46034 (82.8%) steals=41100 staged=223.90 GiB
 ```
 
 Budget `24576` -> **4934 slots** (no 512 cap; `slot_pool` is the pool size),
@@ -122,9 +122,9 @@ Same prompt, cache off vs on. The cache is a pure optimization — outputs
 must match exactly:
 
 ```sh
-DS4_QWEN4_EXPERT_CACHE_MB=0 ./ds4 --cuda -m /path/...-merged.gguf -c 4096 \
+DS4_EXPERT_CACHE_MB=0 ./ds4 --cuda -m /path/...-merged.gguf -c 4096 \
   -p "Explain why MoE models route tokens to experts." > off.txt
-DS4_QWEN4_EXPERT_CACHE_MB=4096 DS4_QWEN4_EXPERT_CACHE_STATS=1 ./ds4 --cuda \
+DS4_EXPERT_CACHE_MB=4096 DS4_EXPERT_CACHE_STATS=1 ./ds4 --cuda \
   -m /path/...-merged.gguf -c 4096 \
   -p "Explain why MoE models route tokens to experts." > on.txt
 diff off.txt on.txt && echo IDENTICAL
@@ -152,7 +152,7 @@ budget well above that. Low budgets trade resident slots for LRU re-stage
 
 ```sh
 for MB in 0 8192 16384 24576; do
-  DS4_QWEN4_EXPERT_CACHE_MB=$MB DS4_QWEN4_EXPERT_CACHE_STATS=1 \
+  DS4_EXPERT_CACHE_MB=$MB DS4_EXPERT_CACHE_STATS=1 \
     ./ds4 --cuda -m /path/...-merged.gguf -c 8192 -p "$(python3 -c \
     'print("Summarize the architecture of a 512-expert MoE. "*200)')" \
     2>&1 | tail -5
@@ -165,5 +165,5 @@ VRAM), lower it; the error message names the failed allocation.
 ## What to send back
 
 1. Unit test output (step 2), 2. `diff` result from step 5, 3. the
-`[qwen4-expert-cache final]` lines + tokens/s from step 6, 4. any allocation
+`[expert-cache final]` lines + tokens/s from step 6, 4. any allocation
 errors with the exact text.

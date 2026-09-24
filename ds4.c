@@ -59,8 +59,8 @@
 #if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
 /* Resident routed-expert cache: discrete CUDA only (the Metal pipeline has
  * its own expert staging). */
-#include "ds4_qwen4_expert_cache.h"
-#define DS4_QWEN4_EXPERT_CACHE 1
+#include "ds4_expert_cache.h"
+#define DS4_EXPERT_CACHE 1
 /* Mapped model base the cache was configured for, reset by model_close. */
 static const void *g_qwen4_expert_cache_map;
 #endif
@@ -2647,13 +2647,13 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 
 static void model_close(ds4_model *m) {
     if (!m) return;
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
     if (g_qwen4_expert_cache_map != NULL && g_qwen4_expert_cache_map == m->map) {
         /* Flush hit/miss stats while the cache is still enabled: shutdown()
-         * clears g_qex_tables so the atexit hook's enabled() guard would
+         * clears g_exp_tables so the atexit hook's enabled() guard would
          * otherwise skip the final dump and print nothing. */
-        ds4_qwen4_expert_cache_log_stats_final();
-        ds4_qwen4_expert_cache_shutdown();
+        ds4_expert_cache_log_stats_final();
+        ds4_expert_cache_shutdown();
         g_qwen4_expert_cache_map = NULL;
     }
 #endif
@@ -57815,12 +57815,12 @@ typedef struct ds4_qwen4_gpu_graph {
     float steer_attn_scale;
     float steer_ffn_scale;
     bool dump_prompt_rows;
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
     /* routed-expert staging: routing ids rewritten to resident slab slots */
-    ds4_gpu_tensor *qex_sel;
-    int32_t *qex_ids;
-    int32_t *qex_slot_of;
-    uint32_t qex_cap;
+    ds4_gpu_tensor *exp_sel;
+    int32_t *exp_ids;
+    int32_t *exp_slot_of;
+    uint32_t exp_cap;
 #endif
 } ds4_qwen4_gpu_graph;
 
@@ -57913,14 +57913,14 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
 
 static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
-#ifdef DS4_QWEN4_EXPERT_CACHE
-    ds4_gpu_tensor_free(g->qex_sel);
-    g->qex_sel = NULL;
-    free(g->qex_ids);
-    g->qex_ids = NULL;
-    free(g->qex_slot_of);
-    g->qex_slot_of = NULL;
-    g->qex_cap = 0;
+#ifdef DS4_EXPERT_CACHE
+    ds4_gpu_tensor_free(g->exp_sel);
+    g->exp_sel = NULL;
+    free(g->exp_ids);
+    g->exp_ids = NULL;
+    free(g->exp_slot_of);
+    g->exp_slot_of = NULL;
+    g->exp_cap = 0;
 #endif
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
@@ -58716,7 +58716,7 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
 /* Read MemTotal and MemAvailable from /proc/meminfo (KiB fields). */
 static bool qwen4_host_ram(uint64_t *total, uint64_t *available) {
     FILE *fp = fopen("/proc/meminfo", "r");
@@ -58750,12 +58750,12 @@ static bool qwen4_host_ram(uint64_t *total, uint64_t *available) {
 static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *w) {
     if (g_qwen4_expert_cache_map == m->map)
         return;
-    ds4_qwen4_expert_cache_shutdown();
+    ds4_expert_cache_shutdown();
     g_qwen4_expert_cache_map = NULL;
     if (!ds4_gpu_is_discrete())
         return;
     uint64_t budget = 0;
-    const char *env = getenv("DS4_QWEN4_EXPERT_CACHE_MB");
+    const char *env = getenv("DS4_EXPERT_CACHE_MB");
     if (env && env[0]) {
         budget = strtoull(env, NULL, 10) * (1024ull * 1024ull);
         if (!budget)
@@ -58771,7 +58771,7 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
          * that still allocate INSIDE this first forward (cuBLAS workspaces,
          * decode-graph capture); a reservation of literally all of free would
          * leave those to fail.  Override the whole policy with
-         * DS4_QWEN4_EXPERT_CACHE_MB (0 disables). */
+         * DS4_EXPERT_CACHE_MB (0 disables). */
         const uint64_t free_b = ds4_gpu_tier_free_vram(0);
         uint64_t headroom = free_b / 16ull;
         if (headroom < (256ull * 1024ull * 1024ull))
@@ -58780,22 +58780,22 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
     }
     if (!budget)
         return;
-    atexit(ds4_qwen4_expert_cache_log_stats_final);
-    static ds4_qwen4_expert_table tables[DS4_MAX_LAYER * 3];
+    atexit(ds4_expert_cache_log_stats_final);
+    static ds4_expert_table tables[DS4_MAX_LAYER * 3];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *t[3] = { w->layer[il].ffn_gate_exps, w->layer[il].ffn_up_exps,
                                    w->layer[il].ffn_down_exps };
         for (int j = 0; j < 3; j++) {
             if (!t[j])
                 return;
-            ds4_qwen4_expert_table *e = &tables[il * 3u + (uint32_t)j];
+            ds4_expert_table *e = &tables[il * 3u + (uint32_t)j];
             e->file_offset = t[j]->abs_offset;
             e->bytes = t[j]->bytes;
             e->count = DS4_N_EXPERT;
             e->type = t[j]->type;
         }
     }
-    if (!ds4_qwen4_expert_cache_configure(tables, (size_t)DS4_N_LAYER * 3u, m->map, budget)) {
+    if (!ds4_expert_cache_configure(tables, (size_t)DS4_N_LAYER * 3u, m->map, budget)) {
         fprintf(stderr, "ds4: Qwen3.8 routed-expert cache disabled (budget %.1f GiB)\n",
                 (double)budget / (1024.0 * 1024.0 * 1024.0));
         return;
@@ -58808,7 +58808,7 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
      * table-kind (gate/up/down), slot_count rows each, reused across every
      * layer via triple-tagged slot reuse, so slab VRAM does NOT scale with the
      * layer count. */
-    const uint32_t qex_slots = ds4_qwen4_expert_cache_slot_count();
+    const uint32_t exp_slots = ds4_expert_cache_slot_count();
     const uint64_t per_slot = (w->layer[0].ffn_gate_exps->bytes +
                                w->layer[0].ffn_up_exps->bytes +
                                w->layer[0].ffn_down_exps->bytes) / DS4_N_EXPERT;
@@ -58837,7 +58837,7 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
             (double)disk_routed / 1073741824.0,
             (double)dense_bytes / 1073741824.0,
             (double)ngram_bytes / 1073741824.0,
-            (double)per_slot * qex_slots / 1073741824.0, qex_slots,
+            (double)per_slot * exp_slots / 1073741824.0, exp_slots,
             (double)per_slot / 1048576.0, (unsigned)DS4_N_LAYER);
     /* Whole-device memory at this point (slabs reserved, dense not yet
      * device-copied).  Routed rows stream through host page cache, so RAM is
@@ -58866,11 +58866,11 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
  * window open until after the mid/down launches, which resolve every expert
  * row on the host. */
 static bool qwen4_graph_moe_stage_experts(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
-    if (!ds4_qwen4_expert_cache_enabled())
+    if (!ds4_expert_cache_enabled())
         return false;
     const uint32_t n_ids = T * DS4_N_EXPERT_USED;
     const uint32_t cap = g->cap_tokens * DS4_N_EXPERT_USED;
-    if (!g->qex_ids || g->qex_cap < cap) {
+    if (!g->exp_ids || g->exp_cap < cap) {
         int32_t *ids = malloc((size_t)cap * sizeof(int32_t));
         int32_t *slot_of = malloc((size_t)DS4_N_EXPERT * sizeof(int32_t));
         ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
@@ -58880,17 +58880,17 @@ static bool qwen4_graph_moe_stage_experts(ds4_qwen4_gpu_graph *g, uint32_t il, u
             ds4_gpu_tensor_free(sel);
             return false;
         }
-        free(g->qex_ids);
-        free(g->qex_slot_of);
-        ds4_gpu_tensor_free(g->qex_sel);
-        g->qex_ids = ids;
-        g->qex_slot_of = slot_of;
-        g->qex_sel = sel;
-        g->qex_cap = cap;
+        free(g->exp_ids);
+        free(g->exp_slot_of);
+        ds4_gpu_tensor_free(g->exp_sel);
+        g->exp_ids = ids;
+        g->exp_slot_of = slot_of;
+        g->exp_sel = sel;
+        g->exp_cap = cap;
     }
-    if (!ds4_gpu_tensor_read(g->selected, 0, g->qex_ids, (uint64_t)n_ids * sizeof(int32_t)))
+    if (!ds4_gpu_tensor_read(g->selected, 0, g->exp_ids, (uint64_t)n_ids * sizeof(int32_t)))
         return false;
-    if (!ds4_qwen4_expert_cache_stage(il, g->qex_ids, n_ids, g->qex_slot_of)) {
+    if (!ds4_expert_cache_stage(il, g->exp_ids, n_ids, g->exp_slot_of)) {
         static bool warned_stage = false;
         if (!warned_stage) {
             warned_stage = true;
@@ -58898,9 +58898,9 @@ static bool qwen4_graph_moe_stage_experts(ds4_qwen4_gpu_graph *g, uint32_t il, u
                     "more distinct experts routed at once than the resident pool holds. "
                     "Cache degrades to uncached (raw-id) reads, which on a discrete GPU "
                     "then device-copies the full routed table - raise "
-                    "DS4_QWEN4_EXPERT_CACHE_MB so slots >= experts routed per layer "
+                    "DS4_EXPERT_CACHE_MB so slots >= experts routed per layer "
                     "(<= %u) fits in VRAM.\n",
-                    n_ids, ds4_qwen4_expert_cache_slot_count(), (unsigned)DS4_N_EXPERT);
+                    n_ids, ds4_expert_cache_slot_count(), (unsigned)DS4_N_EXPERT);
         }
         return false;
     }
@@ -58914,13 +58914,13 @@ static bool qwen4_graph_moe_stage_experts(ds4_qwen4_gpu_graph *g, uint32_t il, u
      * larger than any single layer routes).  Noise ids (id < 0) pass through
      * untouched and are dropped by the kernels. */
     for (uint32_t i = 0; i < n_ids; i++) {
-        const int32_t id = g->qex_ids[i];
+        const int32_t id = g->exp_ids[i];
         if (id >= 0 && (uint32_t)id < DS4_N_EXPERT)
-            g->qex_ids[i] = (int32_t)DS4_N_EXPERT + g->qex_slot_of[id];
+            g->exp_ids[i] = (int32_t)DS4_N_EXPERT + g->exp_slot_of[id];
     }
-    return ds4_gpu_tensor_write(g->qex_sel, 0, g->qex_ids, (uint64_t)n_ids * sizeof(int32_t)) != 0;
+    return ds4_gpu_tensor_write(g->exp_sel, 0, g->exp_ids, (uint64_t)n_ids * sizeof(int32_t)) != 0;
 }
-#endif /* DS4_QWEN4_EXPERT_CACHE */
+#endif /* DS4_EXPERT_CACHE */
 
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T,
                             uint32_t il) {
@@ -58954,12 +58954,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * is neither pinnable (file-backed) nor does it fit.  When the cache is
      * enabled (discrete + budget) the routed experts must stream through the
      * window, which only the per-token kernels stage, so keep mm off. */
-#ifdef DS4_QWEN4_EXPERT_CACHE
-    const bool qex_stream = ds4_qwen4_expert_cache_enabled();
+#ifdef DS4_EXPERT_CACHE
+    const bool exp_stream = ds4_expert_cache_enabled();
 #else
-    const bool qex_stream = false;
+    const bool exp_stream = false;
 #endif
-    const bool mm = T > mm_min && !qex_stream &&
+    const bool mm = T > mm_min && !exp_stream &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
@@ -59042,13 +59042,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #endif
     if (ok) {
         const ds4_gpu_tensor *esel = g->selected;
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
         /* resident rows first: the kernels then resolve slot-encoded ids to
          * the device slab; ids outside the cache (the shared-expert slot)
          * pass through untouched */
         const bool qex = qwen4_graph_moe_stage_experts(g, il, T);
         if (qex)
-            esel = g->qex_sel;
+            esel = g->exp_sel;
 #endif
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, esel, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
@@ -59060,9 +59060,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
         if (qex)
-            ds4_qwen4_expert_cache_unstage();
+            ds4_expert_cache_unstage();
 #endif
     }
     if (ok) {
@@ -59126,7 +59126,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
-#ifdef DS4_QWEN4_EXPERT_CACHE
+#ifdef DS4_EXPERT_CACHE
     qwen4_expert_cache_configure(m, w);
 #endif
     if (all_rows && T > g->n_logit_rows) return false;

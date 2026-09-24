@@ -82,7 +82,7 @@ typedef struct {
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_gpu_tp.h"
-#include "ds4_qwen4_expert_cache.h"
+#include "ds4_expert_cache.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -750,7 +750,7 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
-/* Resident Qwen expert cache (ds4_qwen4_expert_cache.c): while a layer's
+/* Resident expert cache (ds4_expert_cache.c): while a layer's
  * routed-expert kernels are being recorded, the engine opens a window over
  * that layer's three expert tables and has already rewritten the routing ids
  * to slab slot indices.  A window hit therefore translates by arithmetic
@@ -802,20 +802,20 @@ extern "C" int ds4_gpu_is_discrete(void);
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 
-extern "C" ds4_gpu_tensor *ds4_gpu_qwen4_expert_slab_reserve(uint64_t bytes);
-extern "C" void ds4_gpu_qwen4_expert_slab_release(ds4_gpu_tensor *tensor);
+extern "C" ds4_gpu_tensor *ds4_gpu_expert_slab_reserve(uint64_t bytes);
+extern "C" void ds4_gpu_expert_slab_release(ds4_gpu_tensor *tensor);
 
-extern "C" ds4_gpu_tensor *ds4_gpu_qwen4_expert_slab_reserve(uint64_t bytes) {
+extern "C" ds4_gpu_tensor *ds4_gpu_expert_slab_reserve(uint64_t bytes) {
     if (bytes == 0 || g_ssd_streaming_mode || !ds4_gpu_is_discrete())
         return NULL;
     return ds4_gpu_tensor_alloc(bytes);
 }
 
-extern "C" void ds4_gpu_qwen4_expert_slab_release(ds4_gpu_tensor *tensor) {
+extern "C" void ds4_gpu_expert_slab_release(ds4_gpu_tensor *tensor) {
     if (tensor) ds4_gpu_tensor_free(tensor);
 }
 
-extern "C" int ds4_gpu_qwen4_expert_set_window(
+extern "C" int ds4_gpu_expert_set_window(
         const void *map, const uint64_t *table_begin, const uint64_t *table_end,
         const uint64_t *expert_row_bytes, const uint64_t *expert_stride_bytes,
         char *const *slabs) {
@@ -891,7 +891,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
      * read zero-copy over PCIe (per-range cudaHostRegister below).  The arena
      * copy is a unified-memory optimization and would fill VRAM tensor-by-
      * tensor until it OOMs, so skip it here.  Routed-expert residency is owned
-     * by the Qwen expert cache, which registers its own VRAM slabs. */
+     * by the expert cache, which registers its own VRAM slabs. */
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL && !ds4_gpu_is_discrete()) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr || (g_ssd_streaming_mode && g_model_fd >= 0 && model_map == g_model_fd_host_base))
