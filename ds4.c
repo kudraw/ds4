@@ -63,6 +63,7 @@
 #define DS4_EXPERT_CACHE 1
 /* Mapped model base the cache was configured for, reset by model_close. */
 static const void *g_qwen4_expert_cache_map;
+static const void *g_ds41_expert_cache_map;
 #endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
@@ -40345,6 +40346,16 @@ typedef struct {
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
+#ifdef DS4_EXPERT_CACHE
+    /* Routed-expert cache decode staging: host copy of the routing ids, the
+     * expert->slot map, and the device tensor carrying the rewritten slot ids
+     * handed to the routed-MoE kernel in place of g->selected.  Sized lazily on
+     * the first staged decode (mirrors the Qwen3.8 graph). */
+    int32_t *exp_ids;
+    int32_t *exp_slot_of;
+    ds4_gpu_tensor *exp_sel;
+    uint32_t exp_cap;
+#endif
 } ds41_gpu_graph;
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
@@ -40391,6 +40402,11 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     free(g->prefill_ids);
     free(g->rows_view);
     ds4_gpu_tensor_free(g->prefill_tokens);
+#ifdef DS4_EXPERT_CACHE
+    free(g->exp_ids);
+    free(g->exp_slot_of);
+    ds4_gpu_tensor_free(g->exp_sel);
+#endif
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -40879,6 +40895,73 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+/* Read the routing ids back, stage the chosen rows into slab slots and return
+ * the ids rewritten to raw slot indices resident on the device; false leaves
+ * the cache window closed and the raw ids in place.  Unlike the Qwen3.8 graph
+ * (whose kernels were special-cased to decode a count+slot sentinel), the
+ * generic DS4.1 routed-MoE kernels simply index base + id*expert_bytes, so the
+ * ids here are plain slots in [0, slot_count) and the caller passes
+ * kind_stride as the expert stride with n_total_expert = slot_count.  The
+ * staged window is left open; the caller closes it after the routed launch. */
+/* Stage the routed ids of `count` tokens (source tensor `src`, laid out
+ * [count][DS4_N_EXPERT_USED]) into the resident slot pool and re-encode them
+ * as raw slot indices in [0, slot_count) into g->exp_sel.  The DS4.1 kernels
+ * resolve a raw id to the slab only while the cache window is open, so the
+ * caller must run the MoE kernel with selected=g->exp_sel,
+ * n_total_expert=ds4_expert_cache_slot_count() and the gate/down expert byte
+ * strides taken from ds4_expert_cache_kind_stride(), then call
+ * ds4_expert_cache_unstage().  count==1 is the decode path. */
+static bool ds41_moe_stage_experts_n(ds41_gpu_graph *g, uint32_t il,
+                                     const ds4_gpu_tensor *src, uint32_t count) {
+    const uint32_t n_ids = count * DS4_N_EXPERT_USED;
+    const uint32_t cap = n_ids;
+    if (!g->exp_ids || g->exp_cap < cap) {
+        int32_t *ids = malloc((size_t)cap * sizeof(int32_t));
+        int32_t *slot_of = malloc((size_t)DS4_N_EXPERT * sizeof(int32_t));
+        ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
+        if (!ids || !slot_of || !sel) {
+            free(ids);
+            free(slot_of);
+            ds4_gpu_tensor_free(sel);
+            return false;
+        }
+        free(g->exp_ids);
+        free(g->exp_slot_of);
+        ds4_gpu_tensor_free(g->exp_sel);
+        g->exp_ids = ids;
+        g->exp_slot_of = slot_of;
+        g->exp_sel = sel;
+        g->exp_cap = cap;
+    }
+    if (!ds4_gpu_tensor_read(src, 0, g->exp_ids, (uint64_t)n_ids * sizeof(int32_t)))
+        return false;
+    if (!ds4_expert_cache_stage(il, g->exp_ids, n_ids, g->exp_slot_of)) {
+        static bool warned_stage = false;
+        if (!warned_stage) {
+            warned_stage = true;
+            fprintf(stderr, "ds4: DS4.1 expert cache: staging %u ids into %u slots failed; "
+                    "more distinct experts routed at once than the resident pool holds. "
+                    "Cache degrades to uncached reads - on a discrete GPU those reads then "
+                    "device-copy the whole routed table (OOM). Raise DS4_EXPERT_CACHE_MB so "
+                    "the pool holds >= %u experts.\n",
+                    n_ids, ds4_expert_cache_slot_count(), (unsigned)DS4_N_EXPERT);
+        }
+        ds4_expert_cache_unstage();
+        return false;
+    }
+    for (uint32_t i = 0; i < n_ids; i++)
+        g->exp_ids[i] = g->exp_slot_of[g->exp_ids[i]];
+    if (!ds4_gpu_tensor_write(g->exp_sel, 0, g->exp_ids, (uint64_t)n_ids * sizeof(int32_t))) {
+        ds4_expert_cache_unstage();
+        return false;
+    }
+    return true;
+}
+
+static bool ds41_moe_stage_experts(ds41_gpu_graph *g, uint32_t il) {
+    return ds41_moe_stage_experts_n(g, il, g->selected, 1);
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -40918,6 +41001,21 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
+    /* Cache window is single-device only (the TP path repacks per owned
+     * range); when active, stage the routed rows and hand the kernel raw slot
+     * ids with kind_stride as the expert stride. */
+    ds4_gpu_tensor *sel = g->selected;
+    uint64_t cache_gate_bytes = gate_row * DS4_N_FF_EXP;
+    uint64_t cache_down_bytes = down_row * DS4_N_EMBD;
+    uint32_t cache_n_total = DS4_N_EXPERT;
+    const bool cache_on = ds4_expert_cache_enabled() && g->tp_world != 2 &&
+        ds41_moe_stage_experts(g, il);
+    if (cache_on) {
+        sel = g->exp_sel;
+        cache_gate_bytes = ds4_expert_cache_kind_stride(0);
+        cache_down_bytes = ds4_expert_cache_kind_stride(2);
+        cache_n_total = ds4_expert_cache_slot_count();
+    }
 #ifndef __APPLE__
     if (g->tp_world == 2) {
         routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -40932,10 +41030,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
+            cache_gate_bytes, gate_row, cache_down_bytes, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, sel, g->route_weights,
+            cache_n_total, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming);
+    if (cache_on) ds4_expert_cache_unstage();
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
@@ -41309,11 +41408,93 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
     }
 }
 
+#ifdef DS4_EXPERT_CACHE
+/* Byte budget the DS4.1 routed-expert cache will claim, or 0 when it is off
+ * (not discrete CUDA, or DS4_EXPERT_CACHE_MB=0).  Shared by the configure
+ * path and the memory-admission gate so both agree on whether routed experts
+ * stay resident.  When the cache is on the model is mmapped and routed experts
+ * are demand-paged from the file into slots, so only the non-routed bytes need
+ * to be resident (as with --ssd-streaming). */
+/* Whether the routed-expert cache is intended for this run: discrete CUDA and
+ * not explicitly disabled via DS4_EXPERT_CACHE_MB=0.  This must NOT depend on
+ * the live free-VRAM query (ds4_gpu_tier_free_vram): the memory-admission gate
+ * runs before the per-tier device table (g_n_gpus) is built, so a free-VRAM
+ * based check reads 0 there and would make the gate charge the full routed-
+ * expert tables it is supposed to treat as demand-paged. */
+static bool ds41_expert_cache_intended(void) {
+    if (!ds4_gpu_is_discrete())
+        return false;
+    const char *env = getenv("DS4_EXPERT_CACHE_MB");
+    if (env && env[0])
+        return strtoull(env, NULL, 10) > 0;
+    return true;  /* on by default for discrete CUDA */
+}
+
+static uint64_t ds41_expert_cache_budget_bytes(void) {
+    if (!ds41_expert_cache_intended())
+        return 0;
+    const char *env = getenv("DS4_EXPERT_CACHE_MB");
+    if (env && env[0])
+        return strtoull(env, NULL, 10) * (1024ull * 1024ull);
+    /* Default: most of free VRAM minus headroom for in-forward transients
+     * (cuBLAS workspaces, capture).  Same policy as the Qwen3.8 cache. */
+    const uint64_t free_b = ds4_gpu_tier_free_vram(0);
+    uint64_t headroom = free_b / 16ull;
+    if (headroom < (256ull * 1024ull * 1024ull))
+        headroom = 256ull * 1024ull * 1024ull;
+    return free_b > headroom ? free_b - headroom : 0;
+}
+
+/* Configure the shared routed-expert cache for a DS4.1 graph.  Mirrors
+ * qwen4_expert_cache_configure: opt-in via DS4_EXPERT_CACHE_MB, discrete CUDA
+ * only, one resident pool of slots shared by every layer (three slabs,
+ * gate/up/down, DS4_N_EXPERT rows each).  Idempotent per model map. */
+static void ds41_expert_cache_configure(const ds4_model *m, const ds4_weights *w) {
+    if (g_ds41_expert_cache_map == m->map)
+        return;
+    ds4_expert_cache_shutdown();
+    g_ds41_expert_cache_map = NULL;
+    const uint64_t budget = ds41_expert_cache_budget_bytes();
+    if (!budget)
+        return;
+    atexit(ds4_expert_cache_log_stats_final);
+    static ds4_expert_table tables[DS4_MAX_LAYER * 3];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *t[3] = { w->layer[il].ffn_gate_exps, w->layer[il].ffn_up_exps,
+                                   w->layer[il].ffn_down_exps };
+        for (int j = 0; j < 3; j++) {
+            if (!t[j])
+                return;
+            ds4_expert_table *e = &tables[il * 3u + (uint32_t)j];
+            e->file_offset = t[j]->abs_offset;
+            e->bytes = t[j]->bytes;
+            e->count = DS4_N_EXPERT;
+            e->type = t[j]->type;
+        }
+    }
+    if (!ds4_expert_cache_configure(tables, (size_t)DS4_N_LAYER * 3u, m->map, budget)) {
+        fprintf(stderr, "ds4: DS4.1 routed-expert cache disabled (budget %.1f GiB)\n",
+                (double)budget / (1024.0 * 1024.0 * 1024.0));
+        return;
+    }
+    g_ds41_expert_cache_map = m->map;
+    fprintf(stderr, "ds4: DS4.1 routed-expert cache enabled: %.1f GiB, %u slots, "
+            "hits/misses/evictions at exit\n",
+            (double)budget / (1024.0 * 1024.0 * 1024.0), ds4_expert_cache_slot_count());
+}
+#endif
+
 static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il, int token) {
+    /* The routed-expert cache stages rows with host<->device copies and reads
+     * the routing ids back (D2H sync); neither is legal while a CUDA graph is
+     * captured.  When the cache is enabled fall back to the eager path so the
+     * staging syncs run outside capture - trading graph replay for the cache,
+     * which is the whole point of the cache. */
     if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
         g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") ||
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
+        ds4_expert_cache_enabled() ||
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
         return ds41_graph_layer(g, m, l, il, token);
@@ -41368,33 +41549,53 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
-        (
+    if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
+        !ds41_route_batch(g, m, l, count) ||
+        !((shared_owner && g->tp_rank != (il & 1u)) ||
+          (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+           ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+           ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+               count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+           ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+           ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))))
+        return false;
+    /* The cache window is single-device only (the TP path repacks per owned
+     * range).  When active, stage every routed row for the whole prefill
+     * chunk, then hand the batch kernel raw slot ids with kind_stride as the
+     * expert stride and slot_count as the expert total; unstage after. */
+    ds4_gpu_tensor *sel = b->selected;
+    uint64_t cache_gate_bytes = gate_row * DS4_N_FF_EXP;
+    uint64_t cache_down_bytes = down_row * DS4_N_EMBD;
+    uint32_t cache_n_total = DS4_N_EXPERT;
+    const bool cache_on = ds4_expert_cache_enabled() && g->tp_world != 2 &&
+        ds41_moe_stage_experts_n(g, il, b->selected, count);
+    if (cache_on) {
+        sel = g->exp_sel;
+        cache_gate_bytes = ds4_expert_cache_kind_stride(0);
+        cache_down_bytes = ds4_expert_cache_kind_stride(2);
+        cache_n_total = ds4_expert_cache_slot_count();
+    }
+    bool routed_ok;
 #ifndef __APPLE__
-        g->tp_world == 2 ?
-        ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+    if (g->tp_world == 2)
+        routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 2u),
-            DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, b->norm, il, count, &mid_f16) :
+            DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, b->norm, il, count, &mid_f16) != 0;
+    else
 #endif
-        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+        routed_ok = ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, true)) &&
+            cache_gate_bytes, gate_row, cache_down_bytes, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, sel, b->route_weights,
+            cache_n_total, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+            il, count, &mid_f16, true) != 0;
+    if (cache_on) ds4_expert_cache_unstage();
+    return routed_ok &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
@@ -41403,6 +41604,9 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+#ifdef DS4_EXPERT_CACHE
+    ds41_expert_cache_configure(m, w);
+#endif
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -41817,6 +42021,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool decoder_suffix = wide && total_count >= 8192u &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
+#ifdef DS4_EXPERT_CACHE
+    /* The batch MoE below opens the cache window per layer; the cache must be
+     * configured (slabs allocated, window registered) before the first layer.
+     * decode configures lazily in ds41_graph_step, but a fresh prompt hits
+     * prefill first, so configure here too. */
+    ds41_expert_cache_configure(m, w);
+#endif
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
@@ -70802,7 +71013,18 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     }
     if (budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
-    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
+#ifdef DS4_EXPERT_CACHE
+    /* With the routed-expert cache the model is mmapped and routed experts are
+     * demand-paged from the file into VRAM slots, so, as with --ssd-streaming,
+     * only the non-routed bytes must be resident; charging the full expert
+     * tables here would reject a model the cache is meant to make feasible. */
+    const bool cache_resident_routed = !e->ssd_streaming &&
+        ds41_expert_cache_intended();
+#else
+    const bool cache_resident_routed = false;
+#endif
+    if ((e->ssd_streaming || cache_resident_routed) &&
+        !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
     const uint64_t fixed = ds4_add_sat_u64(weights,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));

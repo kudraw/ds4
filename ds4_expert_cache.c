@@ -214,6 +214,16 @@ uint32_t ds4_expert_cache_slot_count(void) {
     return g_exp_slot_count;
 }
 
+/* Device slab row stride (bytes) for one table kind (0=gate,1=up,2=down).
+ * A resident slot is addressed as slab_base + slot * kind_stride, so a caller
+ * that hands the kernels slot indices instead of raw expert ids must pass
+ * this as the expert row stride (it differs from the file row size when the
+ * row is not EXPERT_ALIGN aligned, e.g. IQ2_XXS gate rows of 680 B -> 704).
+ * Returns 0 when the cache is off or the kind is out of range. */
+uint64_t ds4_expert_cache_kind_stride(uint32_t kind) {
+    return ds4_expert_cache_enabled() && kind < 3u ? g_exp_kind_stride[kind] : 0;
+}
+
 bool ds4_expert_cache_lookup(uint32_t phys_layer, uint32_t expert, int32_t *slot) {
     if (!ds4_expert_cache_enabled() || phys_layer >= g_exp_n_tables / 3 ||
         expert >= g_exp_count)

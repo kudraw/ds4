@@ -71,6 +71,16 @@ bool ds4_expert_cache_enabled(void);
 /* Device slab slots per layer table after a successful configure. */
 uint32_t ds4_expert_cache_slot_count(void);
 
+/* Device slab row stride (bytes) for one table kind (0=gate,1=up,2=down).
+ * A resident slot is addressed as slab_base + slot * kind_stride, so a caller
+ * that hands the kernels slot indices in place of raw expert ids must pass
+ * this as the expert row stride.  It differs from the on-disk row size when a
+ * row is not EXPERT_ALIGN aligned (e.g. IQ2_XXS gate/up rows of 680 B use a
+ * 704 B stride).  The three kinds are not necessarily equal (down rows are a
+ * different width than gate/up), so each kind must be passed with its own
+ * stride.  Returns 0 when the cache is off or `kind` is out of range. */
+uint64_t ds4_expert_cache_kind_stride(uint32_t kind);
+
 /* Hit/miss counters to stderr.  Enabled at configure time via
  * DS4_EXPERT_CACHE_STATS. */
 void ds4_expert_cache_log_stats(const char *tag);

@@ -770,6 +770,15 @@ struct cuda_expert_window_entry {
 static const void *g_expert_window_map = NULL;
 static cuda_expert_window_entry g_expert_window[3];
 
+/* True when the routed-expert cache window is open for this model map: expert
+ * bases resolve to device slab rows and the expert-id field carries raw slot
+ * indices, so host-side artifact builders (aligned repack) and the file-size
+ * bounds guards - which assume the whole routed table is read from disk - must
+ * stand down.  The staged ids are slots in [0, slot_count), never file rows. */
+static inline int cuda_expert_window_active(const void *model_map) {
+    return g_expert_window_map != NULL && g_expert_window_map == model_map;
+}
+
 static const char *cuda_expert_window_range_ptr(const void *model_map, uint64_t offset,
                                                 uint64_t bytes) {
     if (!g_expert_window_map || g_expert_window_map != model_map || bytes == 0)
@@ -24644,7 +24653,11 @@ static int routed_moe_launch(
     /* The aligned artifacts replace the raw expert tensors on integrated
      * CUDA systems.  Route both prefill and decode before resolving a raw
      * pointer, otherwise the fallback cache would duplicate tens of GiB. */
-    if (iq2_path && !g_ssd_streaming_mode &&
+    /* The aligned repack reads every routed expert row from the host file by
+     * expert id.  With the cache window open the expert field is a slab slot
+     * and the table base is the device slab, so the repack must be skipped and
+     * the raw (window-aware) path used instead. */
+    if (iq2_path && !g_ssd_streaming_mode && !cuda_expert_window_active(model_map) &&
         cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
@@ -24972,9 +24985,13 @@ static int routed_moe_launch(
      *                  token-indexed decode-style prefill kernels). */
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_bytes > model_size - gate_offset ||
-        gate_bytes > model_size - up_offset ||
-        down_bytes > model_size - down_offset) {
+    /* With the cache window open the whole-table resolve lands on the device
+     * slab and the byte totals describe slab size, not a file span, so the
+     * file-bounds guards do not apply. */
+    if (!cuda_expert_window_active(model_map) &&
+        (gate_bytes > model_size - gate_offset ||
+         gate_bytes > model_size - up_offset ||
+         down_bytes > model_size - down_offset)) {
         return 0;
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
