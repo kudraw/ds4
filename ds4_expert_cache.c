@@ -11,9 +11,38 @@
 #include "ds4_expert_cache.h"
 #include "ds4_gpu.h"
 
+/* Routed-expert quant types the cache may keep resident.  The slab is a pure
+ * byte-copy keyed by row stride, so it is quant-agnostic; the real constraint
+ * is that the device kernel reading the resident rows understands the type.
+ * This allowlist MUST stay a subset of the quant types moe_mv_dispatch
+ * (ds4_qwen4_cuda.cuh) can read for an expert row.  Q8_0/MXFP4 are what the
+ * Qwen3.8 build emits; the K-quants and IQ2_XXS are what the DeepSeek-4.1
+ * (antirez) q2 GGUF emits (gate/up = IQ2_XXS, down = Q2_K). */
+#define EXPERT_TYPE_Q4_0 2u
 #define EXPERT_TYPE_Q8_0 8u
+#define EXPERT_TYPE_Q2_K 10u
+#define EXPERT_TYPE_Q4_K 12u
+#define EXPERT_TYPE_Q5_K 13u
+#define EXPERT_TYPE_Q6_K 14u
+#define EXPERT_TYPE_IQ2_XXS 16u
 #define EXPERT_TYPE_MXFP4 39u
 #define EXPERT_ALIGN 32u
+
+static int exp_type_supported(uint32_t type) {
+    switch (type) {
+    case EXPERT_TYPE_Q4_0:
+    case EXPERT_TYPE_Q8_0:
+    case EXPERT_TYPE_Q2_K:
+    case EXPERT_TYPE_Q4_K:
+    case EXPERT_TYPE_Q5_K:
+    case EXPERT_TYPE_Q6_K:
+    case EXPERT_TYPE_IQ2_XXS:
+    case EXPERT_TYPE_MXFP4:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 typedef struct {
     const void *map;      /* engine model map identity, matches weights() */
@@ -101,7 +130,7 @@ bool ds4_expert_cache_configure(const ds4_expert_table *tables, size_t n_tables,
         if (tables[i].count != count || tables[i].bytes == 0 ||
             tables[i].bytes % count != 0)
             return false;
-        if (tables[i].type != EXPERT_TYPE_Q8_0 && tables[i].type != EXPERT_TYPE_MXFP4)
+        if (!exp_type_supported(tables[i].type))
             return false;
         const uint64_t stride_i = exp_align_up(tables[i].bytes / count, EXPERT_ALIGN);
         const size_t j = i % 3;
