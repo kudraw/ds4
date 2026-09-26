@@ -41409,6 +41409,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef DS4_EXPERT_CACHE
+static bool ds4_host_ram(uint64_t *total, uint64_t *available); /* /proc/meminfo helper, shared */
 /* Byte budget the DS4.1 routed-expert cache will claim, or 0 when it is off
  * (not discrete CUDA, or DS4_EXPERT_CACHE_MB=0).  Shared by the configure
  * path and the memory-admission gate so both agree on whether routed experts
@@ -41481,6 +41482,25 @@ static void ds41_expert_cache_configure(const ds4_model *m, const ds4_weights *w
     fprintf(stderr, "ds4: DS4.1 routed-expert cache enabled: %.1f GiB, %u slots, "
             "hits/misses/evictions at exit\n",
             (double)budget / (1024.0 * 1024.0 * 1024.0), ds4_expert_cache_slot_count());
+    /* Whole-device state at config time (slabs just reserved).  The budget is
+     * free-VRAM-minus-1/16 measured moments ago, so this shows what already
+     * holds the rest of the card (context buffers, dense device copies, CUDA
+     * context / cuBLAS) - no nvidia-smi needed. */
+    const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
+    const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
+    uint64_t ram_total = 0, ram_avail = 0;
+    const bool have_ram = ds4_host_ram(&ram_total, &ram_avail);
+    if (vram_total)
+        fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB (cache %.1f, headroom %.2f)",
+                (double)(vram_total - vram_free) / 1073741824.0,
+                (double)vram_total / 1073741824.0,
+                (double)budget / 1073741824.0,
+                (double)vram_free / 1073741824.0);
+    if (have_ram)
+        fprintf(stderr, ", system RAM used %.2f / %.2f GiB\n",
+                (double)(ram_total - ram_avail) / 1073741824.0, (double)ram_total / 1073741824.0);
+    else
+        fputc('\n', stderr);
 }
 #endif
 
@@ -58929,7 +58949,7 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
 
 #ifdef DS4_EXPERT_CACHE
 /* Read MemTotal and MemAvailable from /proc/meminfo (KiB fields). */
-static bool qwen4_host_ram(uint64_t *total, uint64_t *available) {
+static bool ds4_host_ram(uint64_t *total, uint64_t *available) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp)
         return false;
@@ -59056,7 +59076,7 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
     const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
     const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
     uint64_t ram_total = 0, ram_avail = 0;
-    const bool have_ram = qwen4_host_ram(&ram_total, &ram_avail);
+    const bool have_ram = ds4_host_ram(&ram_total, &ram_avail);
     if (vram_total)
         fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB",
                 (double)(vram_total - vram_free) / 1073741824.0,
