@@ -41410,6 +41410,66 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 
 #ifdef DS4_EXPERT_CACHE
 static bool ds4_host_ram(uint64_t *total, uint64_t *available); /* /proc/meminfo helper, shared */
+/* Shared startup log for the routed-expert cache: IDENTICAL for DS4.1 and
+ * Qwen3.8 (Qwen3.8 is the reference format).  Called from both configure
+ * paths right after the cache is configured.  Three lines: (1) model bytes on
+ * disk split by transport - routed experts streamed, dense/shared eager-
+ * copied to VRAM, n-gram disk pread; (2) the resident cache: three kind slabs
+ * (gate/up/down), slot_count rows each, reused by every layer via triple-
+ * tagged slot reuse, so slab VRAM does NOT scale with the layer count; (3)
+ * whole-device VRAM/RAM state at this point (slabs just reserved) so the
+ * free-VRAM-minus-headroom budget's origin is visible without nvidia-smi. */
+static void ds4_expert_cache_log_start(const ds4_model *m, const ds4_weights *w) {
+    const uint32_t exp_slots = ds4_expert_cache_slot_count();
+    const uint64_t per_slot = (w->layer[0].ffn_gate_exps->bytes +
+                               w->layer[0].ffn_up_exps->bytes +
+                               w->layer[0].ffn_down_exps->bytes) / DS4_N_EXPERT;
+    uint64_t disk_routed = 0;
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+        disk_routed += w->layer[i].ffn_gate_exps->bytes;
+        disk_routed += w->layer[i].ffn_up_exps->bytes;
+        disk_routed += w->layer[i].ffn_down_exps->bytes;
+    }
+    const uint64_t ngram_bytes = m->ngram_tensor ? m->ngram_tensor->bytes : 0;
+    /* In the merged-shard (inline) layout m->size still covers the disk-only
+     * n-gram table, so subtract it as well as the routed bytes; the remainder
+     * is the dense/always-on set (attention, embeddings, layernorm, router,
+     * shared experts) which is small enough to eager-copy into VRAM in full. */
+    const uint64_t total_bytes = m->file_size ? m->file_size : m->size;
+    const uint64_t dense_bytes = total_bytes > disk_routed + ngram_bytes
+                                     ? total_bytes - disk_routed - ngram_bytes
+                                     : 0;
+    fprintf(stderr,
+            "ds4: model %.2f GiB on disk = routed experts %.2f (streamed) + "
+            "dense/shared %.2f (VRAM device-copy) + n-gram %.2f (disk pread)\n"
+            "ds4: routed-expert cache: %.2f GiB VRAM in %u slots x 3 slabs "
+            "(gate/up/down), %.2f MiB/slot, reused by all %u layers; rest streams "
+            "from disk\n",
+            (double)total_bytes / 1073741824.0,
+            (double)disk_routed / 1073741824.0,
+            (double)dense_bytes / 1073741824.0,
+            (double)ngram_bytes / 1073741824.0,
+            (double)per_slot * exp_slots / 1073741824.0, exp_slots,
+            (double)per_slot / 1048576.0, (unsigned)DS4_N_LAYER);
+    /* Whole-device memory at this point (slabs reserved, dense not yet
+     * device-copied).  Routed rows stream through host page cache, so RAM is
+     * charged by the kernel as it caches the model file. */
+    const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
+    const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
+    uint64_t ram_total = 0, ram_avail = 0;
+    const bool have_ram = ds4_host_ram(&ram_total, &ram_avail);
+    if (vram_total)
+        fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB",
+                (double)(vram_total - vram_free) / 1073741824.0,
+                (double)vram_total / 1073741824.0);
+    else
+        fprintf(stderr, "ds4: memory: VRAM n/a");
+    if (have_ram)
+        fprintf(stderr, ", system RAM used %.2f / %.2f GiB\n",
+                (double)(ram_total - ram_avail) / 1073741824.0, (double)ram_total / 1073741824.0);
+    else
+        fputc('\n', stderr);
+}
 /* Byte budget the DS4.1 routed-expert cache will claim, or 0 when it is off
  * (not discrete CUDA, or DS4_EXPERT_CACHE_MB=0).  Shared by the configure
  * path and the memory-admission gate so both agree on whether routed experts
@@ -41479,28 +41539,7 @@ static void ds41_expert_cache_configure(const ds4_model *m, const ds4_weights *w
         return;
     }
     g_ds41_expert_cache_map = m->map;
-    fprintf(stderr, "ds4: DS4.1 routed-expert cache enabled: %.1f GiB, %u slots, "
-            "hits/misses/evictions at exit\n",
-            (double)budget / (1024.0 * 1024.0 * 1024.0), ds4_expert_cache_slot_count());
-    /* Whole-device state at config time (slabs just reserved).  The budget is
-     * free-VRAM-minus-1/16 measured moments ago, so this shows what already
-     * holds the rest of the card (context buffers, dense device copies, CUDA
-     * context / cuBLAS) - no nvidia-smi needed. */
-    const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
-    const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
-    uint64_t ram_total = 0, ram_avail = 0;
-    const bool have_ram = ds4_host_ram(&ram_total, &ram_avail);
-    if (vram_total)
-        fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB (cache %.1f, headroom %.2f)",
-                (double)(vram_total - vram_free) / 1073741824.0,
-                (double)vram_total / 1073741824.0,
-                (double)budget / 1073741824.0,
-                (double)vram_free / 1073741824.0);
-    if (have_ram)
-        fprintf(stderr, ", system RAM used %.2f / %.2f GiB\n",
-                (double)(ram_total - ram_avail) / 1073741824.0, (double)ram_total / 1073741824.0);
-    else
-        fputc('\n', stderr);
+    ds4_expert_cache_log_start(m, w);
 }
 #endif
 
@@ -59032,63 +59071,7 @@ static void qwen4_expert_cache_configure(const ds4_model *m, const ds4_weights *
         return;
     }
     g_qwen4_expert_cache_map = m->map;
-    /* One compact startup block.  Model size on disk split by transport (the
-     * routing experts are NOT kept resident; only a hot slice lives in VRAM and
-     * every other routed row is streamed from disk on demand), then the routed
-     * expert cache itself: three shared device slabs (cudaMalloc), one per
-     * table-kind (gate/up/down), slot_count rows each, reused across every
-     * layer via triple-tagged slot reuse, so slab VRAM does NOT scale with the
-     * layer count. */
-    const uint32_t exp_slots = ds4_expert_cache_slot_count();
-    const uint64_t per_slot = (w->layer[0].ffn_gate_exps->bytes +
-                               w->layer[0].ffn_up_exps->bytes +
-                               w->layer[0].ffn_down_exps->bytes) / DS4_N_EXPERT;
-    uint64_t disk_routed = 0;
-    for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
-        disk_routed += w->layer[i].ffn_gate_exps->bytes;
-        disk_routed += w->layer[i].ffn_up_exps->bytes;
-        disk_routed += w->layer[i].ffn_down_exps->bytes;
-    }
-    const uint64_t ngram_bytes = m->ngram_tensor ? m->ngram_tensor->bytes : 0;
-    /* In the merged-shard (inline) layout m->size still covers the disk-only
-     * n-gram table, so subtract it as well as the routed bytes; the remainder
-     * is the dense/always-on set (attention, embeddings, layernorm, router,
-     * shared experts) which is small enough to eager-copy into VRAM in full. */
-    const uint64_t total_bytes = m->file_size ? m->file_size : m->size;
-    const uint64_t dense_bytes = total_bytes > disk_routed + ngram_bytes
-                                     ? total_bytes - disk_routed - ngram_bytes
-                                     : 0;
-    fprintf(stderr,
-            "ds4: model %.2f GiB on disk = routed experts %.2f (streamed) + "
-            "dense/shared %.2f (VRAM device-copy) + n-gram %.2f (disk pread)\n"
-            "ds4: routed-expert cache: %.2f GiB VRAM in %u slots x 3 slabs "
-            "(gate/up/down), %.2f MiB/slot, reused by all %u layers; rest streams "
-            "from disk\n",
-            (double)total_bytes / 1073741824.0,
-            (double)disk_routed / 1073741824.0,
-            (double)dense_bytes / 1073741824.0,
-            (double)ngram_bytes / 1073741824.0,
-            (double)per_slot * exp_slots / 1073741824.0, exp_slots,
-            (double)per_slot / 1048576.0, (unsigned)DS4_N_LAYER);
-    /* Whole-device memory at this point (slabs reserved, dense not yet
-     * device-copied).  Routed rows stream through host page cache, so RAM is
-     * charged by the kernel as it caches the model file. */
-    const uint64_t vram_total = ds4_gpu_tier_total_vram(0);
-    const uint64_t vram_free = ds4_gpu_tier_free_vram(0);
-    uint64_t ram_total = 0, ram_avail = 0;
-    const bool have_ram = ds4_host_ram(&ram_total, &ram_avail);
-    if (vram_total)
-        fprintf(stderr, "ds4: memory: VRAM used %.2f / %.2f GiB",
-                (double)(vram_total - vram_free) / 1073741824.0,
-                (double)vram_total / 1073741824.0);
-    else
-        fprintf(stderr, "ds4: memory: VRAM n/a");
-    if (have_ram)
-        fprintf(stderr, ", system RAM used %.2f / %.2f GiB\n",
-                (double)(ram_total - ram_avail) / 1073741824.0,
-                (double)ram_total / 1073741824.0);
-    else
-        fputc('\n', stderr);
+    ds4_expert_cache_log_start(m, w);
 }
 
 /* Read the routing ids back, stage the chosen rows into slab slots and
